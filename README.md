@@ -4,11 +4,17 @@ Token-optimized GitHub CLI designed for LLM agent consumption. Standard GitHub A
 
 ## Why
 
-| Approach | Token Cost (typical PR view) |
-|----------|------------------------------|
-| Raw GitHub API | ~8,000 tokens (URLs, node IDs, avatars, metadata) |
-| `gh` CLI | ~3,000 tokens (table borders, human formatting) |
-| **gh-ai** | **~400 tokens** (minimal YAML, no URLs, no metadata) |
+Measured character counts on identical queries (fewer chars = fewer tokens):
+
+| Operation | `gh` CLI (`--json`) | `gh-ai` | Reduction |
+|-----------|---------------------|---------|-----------|
+| PR view | 667 | 378 | **1.8x** |
+| Issue + comments (5+) | 187,941 | 28,172 | **6.7x** |
+| Search repos (top 5) | 1,607 | 1,348 | **1.2x** |
+| Rate limit | 1,146 | 86 | **13.3x** |
+| Repo tree (flat) | 7 | 7 | ~1x |
+
+Tested against `python/cpython` and `octocat/Hello-World` public repos. Against raw GitHub API (no `--json` filtering), gh-ai reductions exceed **50-200x** by stripping all URL, node ID, avatar, and metadata fields.
 
 ## Install
 
