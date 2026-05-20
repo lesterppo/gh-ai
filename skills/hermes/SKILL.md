@@ -46,6 +46,11 @@ gh-ai get-action-errors owner/repo RUN_ID   # Extract error blocks ±10 lines
 ### Write Operations
 
 ```bash
+gh-ai repo-init my-repo --description "A new project"
+gh-ai repo-init my-repo --private
+gh-ai repo-init my-repo --org my-org
+gh-ai repo-init my-repo --dry-run
+
 cat diff.patch | gh-ai apply-patch file.py   # Apply unified diff or search/replace
 
 gh-ai create-pr owner/repo main branch \     # Full PR creation pipeline
