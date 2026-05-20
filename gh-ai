@@ -1,0 +1,726 @@
+#!/usr/bin/env python3
+"""gh-ai — AI-native GitHub CLI. Token-optimized output for LLM consumption."""
+
+import io
+import os
+import re
+import sys
+import time
+import shutil
+import zipfile
+import subprocess
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+
+import click
+import requests
+import yaml
+
+VERSION = "1.0.0"
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+GITHUB_TOKEN = (
+    os.getenv("GITHUB_TOKEN")
+    or os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN")
+    or os.getenv("GH_TOKEN")
+)
+BASE_URL = "https://api.github.com"
+
+IGNORE_EXTS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".mp4", ".mp3", ".wav", ".ogg", ".webm", ".mov",
+    ".pdf", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+    ".exe", ".dll", ".so", ".dylib",
+    ".pyc", ".pyo", ".class",
+}
+IGNORE_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".tox"}
+
+MAX_FILE_LINES = 500
+MAX_LOG_LINES = 500
+
+
+# ---------------------------------------------------------------------------
+# API helpers
+# ---------------------------------------------------------------------------
+def _check_token():
+    if not GITHUB_TOKEN:
+        click.echo("GITHUB_TOKEN (or GITHUB_PERSONAL_ACCESS_TOKEN, GH_TOKEN) not set", err=True)
+        sys.exit(1)
+
+
+def _headers(accept="application/vnd.github.v3+json"):
+    return {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": accept,
+        "User-Agent": "gh-ai",
+    }
+
+
+def _request(path, raw=False, method="GET", json=None, timeout=30, retry=True):
+    """Single API request helper. Returns decoded response (JSON or text). Exits on error."""
+    _check_token()
+    url = f"{BASE_URL}{path}"
+    hdrs = _headers("application/vnd.github.v3.raw" if raw else "application/vnd.github.v3+json")
+    try:
+        if method == "GET":
+            resp = requests.get(url, headers=hdrs, timeout=timeout, allow_redirects=not raw)
+        elif method == "POST":
+            resp = requests.post(url, headers=hdrs, json=json, timeout=timeout)
+        else:
+            resp = requests.request(method, url, headers=hdrs, json=json, timeout=timeout)
+    except requests.RequestException as e:
+        if retry and method == "GET":
+            time.sleep(1)
+            return _request(path, raw=raw, method=method, json=json, timeout=timeout, retry=False)
+        click.echo(f"Request failed: {e}", err=True)
+        sys.exit(2)
+
+    if resp.status_code == 401:
+        click.echo("Bad credentials. Check GITHUB_TOKEN", err=True)
+        sys.exit(3)
+    elif resp.status_code == 403:
+        if "rate limit" in (resp.text or "").lower():
+            reset_ts = resp.headers.get("X-RateLimit-Reset", "unknown")
+            click.echo(f"Rate limited. Resets at {reset_ts}", err=True)
+        else:
+            click.echo(f"Forbidden (403): {resp.text[:200]}", err=True)
+        sys.exit(4)
+    elif resp.status_code == 404:
+        click.echo(f"Not found: {path}", err=True)
+        sys.exit(5)
+    elif resp.status_code >= 400:
+        click.echo(f"HTTP {resp.status_code}: {resp.text[:300]}", err=True)
+        sys.exit(6)
+
+    if raw:
+        return resp.text
+    return resp.json()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _login(user):
+    """Safely extract login from a user object (may be null for ghost accounts)."""
+    if user is None:
+        return "ghost"
+    return user.get("login", "unknown")
+
+
+# ---------------------------------------------------------------------------
+# Formatters
+# ---------------------------------------------------------------------------
+def _count_reactions(issue_data):
+    rxns = issue_data.get("reactions", {})
+    if not rxns:
+        return ""
+    parts = []
+    for emoji in ("+1", "-1", "laugh", "hooray", "confused", "heart", "rocket", "eyes"):
+        count = rxns.get(emoji, 0)
+        if count:
+            parts.append(f"{emoji}:{count}")
+    return ", ".join(parts) if parts else ""
+
+
+def _format_issue(issue, comments):
+    labels = [lbl.get("name", "") for lbl in issue.get("labels", []) if lbl]
+    rxns = _count_reactions(issue)
+    out = {
+        "title": issue.get("title", ""),
+        "state": issue.get("state", ""),
+        "author": _login(issue.get("user")),
+        "body": issue.get("body", ""),
+    }
+    if labels:
+        out["labels"] = ", ".join(labels)
+    if issue.get("state_reason"):
+        out["state_reason"] = issue["state_reason"]
+    if rxns:
+        out["reactions"] = rxns
+    out["comments"] = [
+        {"user": _login(c.get("user")), "body": c.get("body", "")}
+        for c in (comments or [])
+    ]
+    return yaml.dump(out, allow_unicode=True, sort_keys=False, width=120)
+
+
+def _format_log_errors(log_text):
+    lines = log_text.splitlines()
+    patterns = [
+        r"\berror\b", r"\bfail(?:ed|ure)?\b", r"\bexception\b",
+        r"\btraceback\b", r"\bfatal\b",
+    ]
+    compiled = [re.compile(p, re.IGNORECASE) for p in patterns]
+
+    error_lines = set()
+    for i, line in enumerate(lines):
+        for pat in compiled:
+            if pat.search(line):
+                error_lines.add(i)
+                break
+
+    if not error_lines:
+        return "(no errors found in log)"
+
+    context_ranges = []
+    for idx in sorted(error_lines):
+        start = max(0, idx - 10)
+        end = min(len(lines), idx + 11)
+        context_ranges.append((start, end))
+
+    merged = []
+    for start, end in context_ranges:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+
+    out = []
+    total = 0
+    for start, end in merged:
+        if total >= MAX_LOG_LINES:
+            out.append(f"... (truncated at {MAX_LOG_LINES} lines)")
+            break
+        if out:
+            out.append("---")
+        block_end = min(end, start + (MAX_LOG_LINES - total))
+        for i in range(start, block_end):
+            out.append(f"{i + 1}: {lines[i]}")
+            total += 1
+
+    return "\n".join(out)
+
+
+def _format_search_repos(results):
+    out = []
+    items = results.get("items", [])[:5]
+    if not items:
+        return "(no results)"
+    for i, item in enumerate(items, 1):
+        stars = item.get("stargazers_count", 0)
+        lang = item.get("language") or "?"
+        desc = (item.get("description") or "").strip()
+        out.append(f"{i}. {item['full_name']} ★ {stars} | {lang}")
+        if desc:
+            out.append(f"   {desc}")
+    return "\n".join(out)
+
+
+def _format_search_issues(results):
+    out = []
+    items = results.get("items", [])[:5]
+    if not items:
+        return "(no results)"
+    for i, item in enumerate(items, 1):
+        repo = item.get("repository_url", "").rsplit("/", 2)[-2:]
+        repo_name = "/".join(repo) if len(repo) == 2 else "?"
+        title = item.get("title", "")
+        state = item.get("state", "")
+        num = item.get("number", "?")
+        out.append(f"{i}. [{repo_name}#{num}] {title} ({state})")
+    return "\n".join(out)
+
+
+def _format_pr(pr, reviews):
+    labels = [lbl.get("name", "") for lbl in pr.get("labels", []) if lbl]
+    head = pr.get("head", {})
+    base = pr.get("base", {})
+    out = {
+        "title": pr.get("title", ""),
+        "state": pr.get("state", ""),
+        "author": _login(pr.get("user")),
+        "body": pr.get("body", ""),
+        "branch": f"{head.get('ref', '?')} → {base.get('ref', '?')}",
+        "mergeable": pr.get("mergeable_state", "unknown"),
+        "draft": pr.get("draft", False),
+    }
+    if labels:
+        out["labels"] = ", ".join(labels)
+    if pr.get("additions") is not None:
+        out["diff"] = f"+{pr['additions']} -{pr['deletions']} ({pr.get('changed_files', 0)} files)"
+    if pr.get("state_reason"):
+        out["state_reason"] = pr["state_reason"]
+    if reviews:
+        out["reviews"] = [
+            {"user": _login(r.get("user")), "state": r.get("state", ""),
+             "body": (r.get("body") or "")[:200]}
+            for r in reviews
+        ]
+    return yaml.dump(out, allow_unicode=True, sort_keys=False, width=120)
+
+
+def _format_checks(check_runs):
+    if not check_runs:
+        return "(no checks)"
+    lines = []
+    for c in check_runs:
+        name = c.get("name", "?")
+        status = c.get("status", "?")
+        conclusion = c.get("conclusion") or "—"
+        icon = "✓" if conclusion == "success" else "✗" if conclusion in ("failure", "timed_out", "cancelled") else "○"
+        lines.append(f"{icon} {name}: {conclusion} ({status})")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Patch engines
+# ---------------------------------------------------------------------------
+def _apply_diff(filepath, diff_text):
+    hunk_pattern = re.compile(r"^@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@\s*(.*)$", re.MULTILINE)
+
+    if os.path.exists(filepath):
+        with open(filepath, "r") as f:
+            original = f.read()
+        orig_lines = original.splitlines(keepends=True)
+        shutil.copy2(filepath, filepath + ".bak")
+    else:
+        orig_lines = []
+
+    hunks = []
+    current_hunk = None
+    for line in diff_text.splitlines(keepends=True):
+        if line.startswith("@@"):
+            if current_hunk:
+                hunks.append(current_hunk)
+            m = hunk_pattern.match(line)
+            if m:
+                current_hunk = {
+                    "old_start": int(m.group(1)),
+                    "old_count": int(m.group(2)) if m.group(2) else 1,
+                    "new_start": int(m.group(3)),
+                    "new_count": int(m.group(4)) if m.group(4) else 1,
+                    "lines": [],
+                }
+        elif current_hunk is not None:
+            current_hunk["lines"].append(line)
+
+    if current_hunk:
+        hunks.append(current_hunk)
+
+    if not hunks:
+        return _apply_search_replace(filepath, diff_text)
+
+    for hunk in reversed(hunks):
+        old_start = hunk["old_start"] - 1
+        old_count = hunk["old_count"]
+        new_lines = []
+
+        for line in hunk["lines"]:
+            if line.startswith(" "):
+                new_lines.append(line[1:])
+            elif line.startswith("+"):
+                new_lines.append(line[1:])
+
+        if old_start >= 0 and old_count > 0 and orig_lines:
+            line_idx = old_start
+            for line in hunk["lines"]:
+                if line.startswith(" ") or line.startswith("-"):
+                    expected = line[1:].rstrip("\n")
+                    actual = orig_lines[line_idx].rstrip("\n") if line_idx < len(orig_lines) else ""
+                    if expected != actual:
+                        click.echo(
+                            f"Context mismatch at line {line_idx + 1}: "
+                            f"expected '{expected[:60]}' got '{actual[:60]}'",
+                            err=True,
+                        )
+                        sys.exit(1)
+                    line_idx += 1
+
+        end = old_start + old_count if old_start >= 0 else 0
+        if old_start < 0:
+            orig_lines = new_lines
+        else:
+            orig_lines[old_start:end] = new_lines
+
+    with open(filepath, "w") as f:
+        f.write("".join(orig_lines))
+
+    return "✓ Patch applied"
+
+
+def _apply_search_replace(filepath, text):
+    pattern = re.compile(
+        r"<<<<<<< ORIGINAL\n(.*?)=======\n(.*?)>>>>>>> REPLACEMENT",
+        re.DOTALL,
+    )
+
+    if os.path.exists(filepath):
+        with open(filepath, "r") as f:
+            content = f.read()
+    else:
+        content = ""
+
+    matches = pattern.findall(text)
+    if not matches:
+        return "No search/replace blocks found"
+
+    for original, replacement in matches:
+        original = original.rstrip("\n")
+        replacement = replacement.lstrip("\n").rstrip("\n")
+
+        count = content.count(original)
+        if count == 0:
+            click.echo(f"Search block not found in file: {original[:80]}...", err=True)
+            sys.exit(1)
+        elif count > 1:
+            click.echo(f"Search block is not unique (found {count} occurrences)", err=True)
+            sys.exit(1)
+
+        content = content.replace(original, replacement, 1)
+
+    if os.path.exists(filepath):
+        shutil.copy2(filepath, filepath + ".bak")
+    with open(filepath, "w") as f:
+        f.write(content)
+
+    return "✓ Patch applied"
+
+
+# ---------------------------------------------------------------------------
+# Git helpers
+# ---------------------------------------------------------------------------
+def _git(*args):
+    cmd = ["git"] + list(args)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            click.echo(f"Git failed: git {' '.join(args)}\n{result.stderr.strip()}", err=True)
+            sys.exit(7)
+        return result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        click.echo(f"Git timed out: git {' '.join(args)}", err=True)
+        sys.exit(8)
+    except FileNotFoundError:
+        click.echo("git not found on PATH", err=True)
+        sys.exit(9)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+@click.group()
+@click.version_option(version=VERSION, prog_name="gh-ai")
+def cli():
+    """gh-ai — AI-native GitHub CLI. Token-optimized output for LLM agents.
+
+    GITHUB_TOKEN must be set in the environment.
+    """
+    pass
+
+
+# ---- rate-limit ----------------------------------------------------------
+@cli.command()
+def rate_limit():
+    """Show current GitHub API rate limit status."""
+    data = _request("/rate_limit")
+    core = data.get("resources", {}).get("core", {})
+    search = data.get("resources", {}).get("search", {})
+    click.echo(f"core:   {core.get('remaining', '?')}/{core.get('limit', '?')} remaining, resets {time.strftime('%H:%M:%S', time.localtime(core.get('reset', 0)))}")
+    click.echo(f"search: {search.get('remaining', '?')}/{search.get('limit', '?')} remaining, resets {time.strftime('%H:%M:%S', time.localtime(search.get('reset', 0)))}")
+
+
+# ---- repo-tree ----------------------------------------------------------
+@cli.command()
+@click.argument("repo")
+@click.option("--max", "max_results", type=int, default=200, help="Maximum file paths to return")
+def repo_tree(repo, max_results):
+    """Fetch repository file tree, filtered for code files only."""
+    data = _request(f"/repos/{repo}/git/trees/HEAD?recursive=1")
+    tree = data.get("tree", [])
+    if not tree:
+        click.echo("(empty repository or truncated tree)")
+        return
+
+    paths = []
+    for item in tree:
+        path = item.get("path", "")
+        if not path:
+            continue
+        _, ext = os.path.splitext(path)
+        if ext.lower() in IGNORE_EXTS:
+            continue
+        parts = path.split("/")
+        if any(d in IGNORE_DIRS for d in parts):
+            continue
+        paths.append(path)
+
+    paths.sort()
+    total = len(paths)
+    paths = paths[:max_results]
+    for p in paths:
+        click.echo(p)
+    if total > max_results:
+        click.echo(f"... (truncated: {total - max_results} more files)")
+
+
+# ---- file-read ----------------------------------------------------------
+@cli.command()
+@click.argument("repo")
+@click.argument("path")
+@click.option("--start", type=int, default=None, help="First line (1-indexed)")
+@click.option("--end", type=int, default=None, help="Last line (1-indexed, inclusive)")
+def file_read(repo, path, start, end):
+    """Read a file with line numbers. Supports --start/--end for slicing."""
+    encoded_path = urllib.parse.quote(path, safe="")
+    text = _request(f"/repos/{repo}/contents/{encoded_path}", raw=True)
+
+    lines = text.splitlines()
+    line_start = start or 1
+    line_end = end or len(lines)
+
+    if line_start < 1:
+        line_start = 1
+    if line_end > len(lines):
+        line_end = len(lines)
+
+    sliced = lines[line_start - 1 : line_end]
+    total = len(sliced)
+
+    if total > MAX_FILE_LINES:
+        sliced = sliced[:MAX_FILE_LINES]
+        trunc = True
+    else:
+        trunc = False
+
+    for i, line in enumerate(sliced):
+        click.echo(f"{line_start + i}: {line}")
+
+    if trunc:
+        click.echo(f"... (truncated: {total - MAX_FILE_LINES} more lines)")
+
+
+# ---- issue-view ---------------------------------------------------------
+@cli.command()
+@click.argument("repo")
+@click.argument("issue_number", type=int)
+def issue_view(repo, issue_number):
+    """View issue with all comments in compact YAML.
+
+    REPO format: owner/name
+    """
+    _check_token()
+
+    base = f"{BASE_URL}/repos/{repo}/issues/{issue_number}"
+
+    def fetch_issue():
+        return requests.get(base, headers=_headers(), timeout=30).json()
+
+    def fetch_comments():
+        return requests.get(f"{base}/comments", headers=_headers(), timeout=30).json()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        issue_future = executor.submit(fetch_issue)
+        comments_future = executor.submit(fetch_comments)
+        issue = issue_future.result()
+        comments = comments_future.result()
+
+    if "message" in issue:
+        click.echo(f"Not found: {repo}#{issue_number}", err=True)
+        sys.exit(5)
+
+    click.echo(_format_issue(issue, comments))
+
+
+# ---- pr-view ------------------------------------------------------------
+@cli.command()
+@click.argument("repo")
+@click.argument("pr_number", type=int)
+def pr_view(repo, pr_number):
+    """View pull request with reviews in compact YAML."""
+    _check_token()
+
+    def fetch_pr():
+        return requests.get(
+            f"{BASE_URL}/repos/{repo}/pulls/{pr_number}",
+            headers=_headers(),
+            timeout=30,
+        ).json()
+
+    def fetch_reviews():
+        return requests.get(
+            f"{BASE_URL}/repos/{repo}/pulls/{pr_number}/reviews",
+            headers=_headers(),
+            timeout=30,
+        ).json()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        pr_future = executor.submit(fetch_pr)
+        reviews_future = executor.submit(fetch_reviews)
+        pr = pr_future.result()
+        reviews = reviews_future.result()
+
+    if "message" in pr:
+        click.echo(f"Not found: {repo}#{pr_number}", err=True)
+        sys.exit(5)
+
+    click.echo(_format_pr(pr, reviews))
+
+
+# ---- pr-checks ----------------------------------------------------------
+@cli.command()
+@click.argument("repo")
+@click.argument("pr_number", type=int)
+def pr_checks(repo, pr_number):
+    """Show CI check statuses for a PR. Returns one line per check with conclusion."""
+    _check_token()
+
+    # Get head SHA from PR
+    pr = requests.get(
+        f"{BASE_URL}/repos/{repo}/pulls/{pr_number}",
+        headers=_headers(),
+        timeout=30,
+    ).json()
+    if "message" in pr:
+        click.echo(f"Not found: {repo}#{pr_number}", err=True)
+        sys.exit(5)
+
+    head_sha = pr.get("head", {}).get("sha")
+    if not head_sha:
+        click.echo("No head SHA found", err=True)
+        sys.exit(1)
+
+    # Fetch check runs
+    check_runs = requests.get(
+        f"{BASE_URL}/repos/{repo}/commits/{head_sha}/check-runs",
+        headers=_headers("application/vnd.github.v3+json"),
+        timeout=30,
+    ).json()
+
+    runs = check_runs.get("check_runs", [])
+    click.echo(_format_checks(runs))
+
+
+# ---- search -------------------------------------------------------------
+@cli.command()
+@click.argument("query")
+@click.option("--type", "search_type", type=click.Choice(["repos", "issues"]), default="repos",
+              help="Search repositories or issues")
+def search(query, search_type):
+    """Search GitHub repositories or issues. Returns top 5 results."""
+    encoded = urllib.parse.quote(query)
+    if search_type == "repos":
+        data = _request(f"/search/repositories?q={encoded}&per_page=5&sort=stars&order=desc")
+        click.echo(_format_search_repos(data))
+    else:
+        data = _request(f"/search/issues?q={encoded}&per_page=5&sort=created&order=desc")
+        click.echo(_format_search_issues(data))
+
+
+# ---- get-action-errors --------------------------------------------------
+@cli.command()
+@click.argument("repo")
+@click.argument("run_id")
+def get_action_errors(repo, run_id):
+    """Fetch GitHub Actions logs and extract only error blocks with context."""
+    _request(f"/repos/{repo}/actions/runs/{run_id}")
+
+    url = f"{BASE_URL}/repos/{repo}/actions/runs/{run_id}/logs"
+    resp = requests.get(url, headers=_headers(), allow_redirects=True, timeout=60)
+    if resp.status_code != 200:
+        click.echo(f"Failed to fetch logs: HTTP {resp.status_code}", err=True)
+        sys.exit(6)
+
+    ansi_escape = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            all_logs = []
+            for name in sorted(zf.namelist()):
+                with zf.open(name) as f:
+                    text = f.read().decode("utf-8", errors="replace")
+                    text = ansi_escape.sub("", text)
+                    all_logs.append(f"# {name}\n{text}")
+            log_text = "\n".join(all_logs)
+    except (zipfile.BadZipFile, OSError):
+        log_text = ansi_escape.sub("", resp.text)
+
+    click.echo(_format_log_errors(log_text))
+
+
+# ---- apply-patch --------------------------------------------------------
+@cli.command()
+@click.argument("file_path")
+def apply_patch(file_path):
+    """Apply a patch from stdin (unified diff or search/replace block)."""
+    if sys.stdin.isatty():
+        click.echo("No patch provided on stdin. Pipe a diff or search/replace block.", err=True)
+        sys.exit(1)
+
+    patch_text = sys.stdin.read()
+
+    if not patch_text.strip():
+        click.echo("Empty patch input.", err=True)
+        sys.exit(1)
+
+    if patch_text.startswith("<<<<<<< ORIGINAL") or "<<<<<<< ORIGINAL" in patch_text:
+        result = _apply_search_replace(file_path, patch_text)
+    elif re.search(r"^--- .+\n\+\+\+ .+", patch_text, re.MULTILINE) or "@@" in patch_text:
+        result = _apply_diff(file_path, patch_text)
+    else:
+        if "<<<<<<<" in patch_text:
+            result = _apply_search_replace(file_path, patch_text)
+        else:
+            result = _apply_diff(file_path, patch_text)
+
+    click.echo(result)
+
+
+# ---- create-pr ----------------------------------------------------------
+@cli.command()
+@click.argument("repo")
+@click.argument("base_branch")
+@click.argument("new_branch")
+@click.option("--title", required=True, help="PR title (also used as commit message)")
+@click.option("--body", required=True, help="PR description")
+@click.option("--draft", is_flag=True, default=False, help="Create as draft PR")
+@click.option("--dry-run", is_flag=True, default=False, help="Show what would happen, stop before push")
+def create_pr(repo, base_branch, new_branch, title, body, draft, dry_run):
+    """Macro: commit local changes, push, and create a PR."""
+    _check_token()
+
+    status = _git("status", "--porcelain")
+    if not status.strip():
+        click.echo("No changes to commit (working tree clean)", err=True)
+        sys.exit(1)
+
+    click.echo(f"1. Creating branch: {new_branch}")
+    _git("checkout", "-b", new_branch)
+
+    click.echo("2. Staging all changes")
+    _git("add", "-A")
+
+    click.echo(f"3. Committing: {title}")
+    _git("commit", "-m", title)
+
+    if dry_run:
+        click.echo(f"\nDry run — stopping before push. Branch: {new_branch}")
+        click.echo("Changes committed locally but NOT pushed.")
+        return
+
+    click.echo(f"4. Pushing to origin/{new_branch}")
+    _git("push", "origin", new_branch)
+
+    click.echo("5. Creating pull request...")
+    payload = {"title": title, "body": body, "head": new_branch, "base": base_branch, "draft": draft}
+    resp = requests.post(
+        f"{BASE_URL}/repos/{repo}/pulls",
+        headers=_headers(),
+        json=payload,
+        timeout=30,
+    )
+    if resp.status_code == 201:
+        pr = resp.json()
+        click.echo(f"✓ PR #{pr['number']} created: {pr['html_url']}")
+    else:
+        click.echo(f"Failed to create PR: HTTP {resp.status_code}\n{resp.text[:300]}", err=True)
+        sys.exit(6)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    cli()
