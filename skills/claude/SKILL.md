@@ -75,6 +75,12 @@ gh-ai get-action-errors owner/repo 1234567890
 ### Write Operations
 
 ```bash
+# Create a new GitHub repo and push local content as the initial commit
+gh-ai repo-init my-new-repo --description "A new project"
+gh-ai repo-init my-repo --private                  # Private repo
+gh-ai repo-init my-repo --org my-org               # Under organization
+gh-ai repo-init my-repo --dry-run                  # Preview without creating
+
 # Apply a unified diff from stdin
 cat patch.diff | gh-ai apply-patch path/to/file.py
 

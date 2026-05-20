@@ -387,7 +387,11 @@ def _git(*args):
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
-            click.echo(f"Git failed: git {' '.join(args)}\n{result.stderr.strip()}", err=True)
+            err = result.stderr.strip()
+            if "Author identity unknown" in err:
+                click.echo("Git identity not set. Run:\n  git config user.email \"you@example.com\"\n  git config user.name \"Your Name\"", err=True)
+            else:
+                click.echo(f"Git failed: git {' '.join(args)}\n{err}", err=True)
             sys.exit(7)
         return result.stdout.strip()
     except subprocess.TimeoutExpired:
@@ -666,6 +670,101 @@ def apply_patch(file_path):
             result = _apply_diff(file_path, patch_text)
 
     click.echo(result)
+
+
+# ---- repo-init ----------------------------------------------------------
+@cli.command()
+@click.argument("name")
+@click.option("--description", default="", help="Repository description")
+@click.option("--private", "private_", is_flag=True, default=False, help="Create private repo")
+@click.option("--org", default=None, help="Create under an organization instead of user")
+@click.option("--dry-run", is_flag=True, default=False, help="Show what would happen, don't create repo")
+def repo_init(name, description, private_, org, dry_run):
+    """Create a new GitHub repo and push local content as the initial commit.
+
+    NAME is the repository name (creates owner/NAME under your user or --org).
+    """
+    _check_token()
+
+    # Check for content to push
+    status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout.strip()
+    has_changes = bool(status)
+    is_repo = os.path.isdir(".git")
+
+    if not is_repo and not has_changes:
+        # Check if there are any files at all
+        if not os.listdir("."):
+            click.echo("No files to push. Create some files first.", err=True)
+            sys.exit(1)
+
+    # Determine owner
+    if org:
+        owner = org
+        repo_path = f"{org}/{name}"
+        create_url = f"/orgs/{org}/repos"
+    else:
+        # Get authenticated user
+        user_data = _request("/user")
+        owner = user_data["login"]
+        repo_path = f"{owner}/{name}"
+        create_url = "/user/repos"
+
+    payload = {"name": name, "description": description, "private": private_, "auto_init": False}
+
+    # Step 1: Create repo on GitHub
+    if dry_run:
+        click.echo(f"Would create {'private' if private_ else 'public'} repo: {repo_path}")
+    else:
+        click.echo(f"1. Creating {'private' if private_ else 'public'} repo: {repo_path}")
+        resp = requests.post(
+            f"{BASE_URL}{create_url}",
+            headers=_headers(),
+            json=payload,
+            timeout=30,
+        )
+        if resp.status_code == 422:
+            click.echo(f"Repo {repo_path} may already exist: {resp.json().get('errors', [{}])[0].get('message', 'unknown')}", err=True)
+            sys.exit(6)
+        elif resp.status_code != 201:
+            click.echo(f"Failed to create repo: HTTP {resp.status_code}\n{resp.text[:300]}", err=True)
+            sys.exit(6)
+        repo_data = resp.json()
+        clone_url = repo_data["clone_url"]
+
+    # Step 2: Init git if needed
+    if not is_repo:
+        click.echo("2. Initializing git repository")
+        if not dry_run:
+            _git("init")
+    else:
+        click.echo("2. Using existing git repository")
+
+    # Step 3: Stage and commit
+    if has_changes or not is_repo:
+        click.echo("3. Staging all files")
+        if not dry_run:
+            _git("add", "-A")
+        click.echo("4. Committing")
+        if not dry_run:
+            _git("commit", "-m", description or "Initial commit")
+    else:
+        click.echo("3-4. Using existing commits")
+
+    if dry_run:
+        click.echo(f"\nDry run — would push to {repo_path}")
+        return
+
+    # Step 5: Set remote and push
+    click.echo("5. Setting remote and pushing to main")
+    remotes = subprocess.run(["git", "remote"], capture_output=True, text=True).stdout.strip()
+    if "origin" in remotes.splitlines():
+        _git("remote", "set-url", "origin", clone_url)
+    else:
+        _git("remote", "add", "origin", clone_url)
+    _git("branch", "-M", "main")
+    _git("push", "-u", "origin", "main")
+
+    click.echo(f"✓ Repo created: {repo_data['html_url']}")
 
 
 # ---- create-pr ----------------------------------------------------------
