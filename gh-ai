@@ -16,7 +16,7 @@ import click
 import requests
 import yaml
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # Config
@@ -60,7 +60,6 @@ def _headers(accept="application/vnd.github.v3+json"):
 
 
 def _request(path, raw=False, method="GET", json=None, timeout=30, retry=True):
-    """Single API request helper. Returns decoded response (JSON or text). Exits on error."""
     _check_token()
     url = f"{BASE_URL}{path}"
     hdrs = _headers("application/vnd.github.v3.raw" if raw else "application/vnd.github.v3+json")
@@ -69,6 +68,12 @@ def _request(path, raw=False, method="GET", json=None, timeout=30, retry=True):
             resp = requests.get(url, headers=hdrs, timeout=timeout, allow_redirects=not raw)
         elif method == "POST":
             resp = requests.post(url, headers=hdrs, json=json, timeout=timeout)
+        elif method == "PUT":
+            resp = requests.put(url, headers=hdrs, json=json, timeout=timeout)
+        elif method == "PATCH":
+            resp = requests.patch(url, headers=hdrs, json=json, timeout=timeout)
+        elif method == "DELETE":
+            resp = requests.delete(url, headers=hdrs, timeout=timeout)
         else:
             resp = requests.request(method, url, headers=hdrs, json=json, timeout=timeout)
     except requests.RequestException as e:
@@ -104,10 +109,34 @@ def _request(path, raw=False, method="GET", json=None, timeout=30, retry=True):
 # Helpers
 # ---------------------------------------------------------------------------
 def _login(user):
-    """Safely extract login from a user object (may be null for ghost accounts)."""
     if user is None:
         return "ghost"
     return user.get("login", "unknown")
+
+
+def _resolve_body(body, body_file):
+    """Resolve body text from --body, --body-file, or stdin. Exits if none provided."""
+    if body:
+        return body
+    if body_file:
+        try:
+            with open(body_file, "r") as f:
+                return f.read()
+        except OSError as e:
+            click.echo(f"Cannot read body file: {e}", err=True)
+            sys.exit(1)
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    return ""
+
+
+def _require_body(body, body_file):
+    """Resolve body and require that it's non-empty."""
+    text = _resolve_body(body, body_file)
+    if not text.strip():
+        click.echo("No body provided. Use --body, --body-file, or pipe text on stdin.", err=True)
+        sys.exit(1)
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -501,10 +530,7 @@ def file_read(repo, path, start, end):
 @click.argument("repo")
 @click.argument("issue_number", type=int)
 def issue_view(repo, issue_number):
-    """View issue with all comments in compact YAML.
-
-    REPO format: owner/name
-    """
+    """View issue with all comments in compact YAML."""
     _check_token()
 
     base = f"{BASE_URL}/repos/{repo}/issues/{issue_number}"
@@ -526,6 +552,26 @@ def issue_view(repo, issue_number):
         sys.exit(5)
 
     click.echo(_format_issue(issue, comments))
+
+
+# ---- issue-create -------------------------------------------------------
+@cli.command()
+@click.argument("repo")
+@click.option("--title", required=True, help="Issue title")
+@click.option("--body", default=None, help="Issue body text")
+@click.option("--body-file", default=None, help="Read body from file")
+@click.option("--label", "labels", multiple=True, help="Add label (repeatable)")
+def issue_create(repo, title, body, body_file, labels):
+    """Create a new issue."""
+    _check_token()
+
+    resolved_body = _require_body(body, body_file)
+    payload = {"title": title, "body": resolved_body}
+    if labels:
+        payload["labels"] = list(labels)
+
+    data = _request(f"/repos/{repo}/issues", method="POST", json=payload)
+    click.echo(f"✓ Issue #{data['number']} created: {data['html_url']}")
 
 
 # ---- pr-view ------------------------------------------------------------
@@ -571,7 +617,6 @@ def pr_checks(repo, pr_number):
     """Show CI check statuses for a PR. Returns one line per check with conclusion."""
     _check_token()
 
-    # Get head SHA from PR
     pr = requests.get(
         f"{BASE_URL}/repos/{repo}/pulls/{pr_number}",
         headers=_headers(),
@@ -586,15 +631,144 @@ def pr_checks(repo, pr_number):
         click.echo("No head SHA found", err=True)
         sys.exit(1)
 
-    # Fetch check runs
     check_runs = requests.get(
         f"{BASE_URL}/repos/{repo}/commits/{head_sha}/check-runs",
-        headers=_headers("application/vnd.github.v3+json"),
+        headers=_headers(),
         timeout=30,
     ).json()
 
     runs = check_runs.get("check_runs", [])
     click.echo(_format_checks(runs))
+
+
+# ---- pr-diff ------------------------------------------------------------
+@cli.command()
+@click.argument("repo")
+@click.argument("pr_number", type=int)
+@click.option("--max-lines", type=int, default=300, help="Maximum diff lines (default 300)")
+def pr_diff(repo, pr_number, max_lines):
+    """Get PR diff with line numbers. Truncated by default."""
+    _check_token()
+
+    text = requests.get(
+        f"{BASE_URL}/repos/{repo}/pulls/{pr_number}",
+        headers=_headers("application/vnd.github.v3.diff"),
+        timeout=30,
+    ).text
+
+    if not text:
+        click.echo("(empty diff)")
+        return
+
+    lines = text.splitlines()
+    total = len(lines)
+    if total > max_lines:
+        lines = lines[:max_lines]
+
+    for i, line in enumerate(lines, 1):
+        click.echo(f"{i}: {line}")
+
+    if total > max_lines:
+        click.echo(f"... (truncated: {total - max_lines} more lines)")
+
+
+# ---- pr-status ----------------------------------------------------------
+@cli.command()
+@click.argument("repo")
+@click.argument("pr_number", type=int)
+def pr_status(repo, pr_number):
+    """One-line PR status: state, mergeable, CI conclusion, URL."""
+    _check_token()
+
+    pr = requests.get(
+        f"{BASE_URL}/repos/{repo}/pulls/{pr_number}",
+        headers=_headers(),
+        timeout=30,
+    ).json()
+    if "message" in pr:
+        click.echo(f"Not found: {repo}#{pr_number}", err=True)
+        sys.exit(5)
+
+    state = pr.get("state", "?")
+    merged = pr.get("merged", False)
+    draft = "📝" if pr.get("draft") else ""
+    mergeable = pr.get("mergeable_state", "?")
+
+    # Get CI conclusion from head SHA
+    head_sha = pr.get("head", {}).get("sha")
+    ci = "?"
+    if head_sha:
+        checks = requests.get(
+            f"{BASE_URL}/repos/{repo}/commits/{head_sha}/check-runs",
+            headers=_headers(),
+            timeout=30,
+        ).json()
+        conclusions = {c.get("conclusion") for c in checks.get("check_runs", []) if c.get("conclusion")}
+        if not conclusions:
+            ci = "no_checks"
+        elif all(c == "success" for c in conclusions):
+            ci = "✓"
+        elif any(c in ("failure", "timed_out", "cancelled") for c in conclusions):
+            ci = "✗"
+        else:
+            ci = "○"
+
+    status = "merged" if merged else state
+    click.echo(f"{status}{' ' + draft if draft else ''} | mergeable: {mergeable} | ci: {ci} | {pr['html_url']}")
+
+
+# ---- pr-merge -----------------------------------------------------------
+@cli.command()
+@click.argument("repo")
+@click.argument("pr_number", type=int)
+@click.option("--squash", is_flag=True, default=False, help="Squash and merge")
+@click.option("--rebase", is_flag=True, default=False, help="Rebase and merge")
+@click.option("--delete-branch", is_flag=True, default=False, help="Delete head branch after merge")
+def pr_merge(repo, pr_number, squash, rebase, delete_branch):
+    """Merge a PR. Defaults to standard merge commit."""
+    _check_token()
+
+    if squash and rebase:
+        click.echo("Cannot use both --squash and --rebase", err=True)
+        sys.exit(1)
+
+    method = "squash" if squash else "rebase" if rebase else "merge"
+    payload = {"merge_method": method}
+    if delete_branch:
+        payload["delete_branch"] = True
+
+    data = _request(
+        f"/repos/{repo}/pulls/{pr_number}/merge",
+        method="PUT",
+        json=payload,
+    )
+    if data.get("merged"):
+        msg = "✓ Merged"
+        if delete_branch:
+            msg += " (branch deleted)"
+        click.echo(f"{msg}: {data.get('message', '')}")
+    else:
+        click.echo(f"Merge failed: {data.get('message', 'unknown')}", err=True)
+        sys.exit(6)
+
+
+# ---- pr-comment ---------------------------------------------------------
+@cli.command()
+@click.argument("repo")
+@click.argument("number", type=int)
+@click.option("--body", default=None, help="Comment text")
+@click.option("--body-file", default=None, help="Read comment from file")
+def pr_comment(repo, number, body, body_file):
+    """Add a comment to an issue or pull request."""
+    _check_token()
+
+    resolved_body = _require_body(body, body_file)
+    data = _request(
+        f"/repos/{repo}/issues/{number}/comments",
+        method="POST",
+        json={"body": resolved_body},
+    )
+    click.echo(f"✓ Comment added: {data['html_url']}")
 
 
 # ---- search -------------------------------------------------------------
@@ -680,30 +854,23 @@ def apply_patch(file_path):
 @click.option("--org", default=None, help="Create under an organization instead of user")
 @click.option("--dry-run", is_flag=True, default=False, help="Show what would happen, don't create repo")
 def repo_init(name, description, private_, org, dry_run):
-    """Create a new GitHub repo and push local content as the initial commit.
-
-    NAME is the repository name (creates owner/NAME under your user or --org).
-    """
+    """Create a new GitHub repo and push local content as the initial commit."""
     _check_token()
 
-    # Check for content to push
     status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout.strip()
     has_changes = bool(status)
     is_repo = os.path.isdir(".git")
 
     if not is_repo and not has_changes:
-        # Check if there are any files at all
         if not os.listdir("."):
             click.echo("No files to push. Create some files first.", err=True)
             sys.exit(1)
 
-    # Determine owner
     if org:
         owner = org
         repo_path = f"{org}/{name}"
         create_url = f"/orgs/{org}/repos"
     else:
-        # Get authenticated user
         user_data = _request("/user")
         owner = user_data["login"]
         repo_path = f"{owner}/{name}"
@@ -711,7 +878,6 @@ def repo_init(name, description, private_, org, dry_run):
 
     payload = {"name": name, "description": description, "private": private_, "auto_init": False}
 
-    # Step 1: Create repo on GitHub
     if dry_run:
         click.echo(f"Would create {'private' if private_ else 'public'} repo: {repo_path}")
     else:
@@ -731,7 +897,6 @@ def repo_init(name, description, private_, org, dry_run):
         repo_data = resp.json()
         clone_url = repo_data["clone_url"]
 
-    # Step 2: Init git if needed
     if not is_repo:
         click.echo("2. Initializing git repository")
         if not dry_run:
@@ -739,7 +904,13 @@ def repo_init(name, description, private_, org, dry_run):
     else:
         click.echo("2. Using existing git repository")
 
-    # Step 3: Stage and commit
+    # Ensure git identity is set (only matters for fresh repos)
+    if not dry_run:
+        for key, default in [("user.email", "gh-ai@agent.local"), ("user.name", "gh-ai")]:
+            val = subprocess.run(["git", "config", key], capture_output=True, text=True).stdout.strip()
+            if not val:
+                _git("config", key, default)
+
     if has_changes or not is_repo:
         click.echo("3. Staging all files")
         if not dry_run:
@@ -754,7 +925,6 @@ def repo_init(name, description, private_, org, dry_run):
         click.echo(f"\nDry run — would push to {repo_path}")
         return
 
-    # Step 5: Set remote and push
     click.echo("5. Setting remote and pushing to main")
     remotes = subprocess.run(["git", "remote"], capture_output=True, text=True).stdout.strip()
     if "origin" in remotes.splitlines():
@@ -773,12 +943,18 @@ def repo_init(name, description, private_, org, dry_run):
 @click.argument("base_branch")
 @click.argument("new_branch")
 @click.option("--title", required=True, help="PR title (also used as commit message)")
-@click.option("--body", required=True, help="PR description")
+@click.option("--body", default=None, help="PR description")
+@click.option("--body-file", default=None, help="Read PR description from file")
 @click.option("--draft", is_flag=True, default=False, help="Create as draft PR")
 @click.option("--dry-run", is_flag=True, default=False, help="Show what would happen, stop before push")
-def create_pr(repo, base_branch, new_branch, title, body, draft, dry_run):
-    """Macro: commit local changes, push, and create a PR."""
+def create_pr(repo, base_branch, new_branch, title, body, body_file, draft, dry_run):
+    """Macro: commit local changes, push, and create a PR.
+
+    Body can come from --body, --body-file, or stdin.
+    """
     _check_token()
+
+    resolved_body = _require_body(body, body_file)
 
     status = _git("status", "--porcelain")
     if not status.strip():
@@ -803,7 +979,7 @@ def create_pr(repo, base_branch, new_branch, title, body, draft, dry_run):
     _git("push", "origin", new_branch)
 
     click.echo("5. Creating pull request...")
-    payload = {"title": title, "body": body, "head": new_branch, "base": base_branch, "draft": draft}
+    payload = {"title": title, "body": resolved_body, "head": new_branch, "base": base_branch, "draft": draft}
     resp = requests.post(
         f"{BASE_URL}/repos/{repo}/pulls",
         headers=_headers(),
