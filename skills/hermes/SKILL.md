@@ -58,6 +58,19 @@ gh-ai create-pr owner/repo main branch \     # Full PR creation pipeline
 
 gh-ai create-pr owner/repo main branch \     # Dry-run first
   --title "Test" --body "Test" --dry-run
+
+# Body from file or stdin
+echo "Body" | gh-ai create-pr owner/repo main branch --title "Fix"
+gh-ai create-pr owner/repo main branch --title "Fix" --body-file body.md
+
+# Merge, status, diff
+gh-ai pr-merge owner/repo 42 --squash --delete-branch
+gh-ai pr-status owner/repo 42
+gh-ai pr-diff owner/repo 42 --max-lines 100
+
+# Comment and issues
+echo "LGTM" | gh-ai pr-comment owner/repo 42
+gh-ai issue-create owner/repo --title "Bug" --body "Details" --label bug
 ```
 
 ## Output Rules

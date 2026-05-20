@@ -105,6 +105,30 @@ gh-ai create-pr owner/repo main feature-branch \
 # Create as draft PR
 gh-ai create-pr owner/repo main feature-branch \
   --title "WIP: Refactor" --body "Still in progress" --draft
+
+# Body from file or stdin
+echo "Long body text..." | gh-ai create-pr owner/repo main branch --title "Fix"
+gh-ai create-pr owner/repo main branch --title "Fix" --body-file body.md
+
+# Merge a PR
+gh-ai pr-merge owner/repo 42
+gh-ai pr-merge owner/repo 42 --squash --delete-branch
+gh-ai pr-merge owner/repo 42 --rebase
+
+# One-line PR status
+gh-ai pr-status owner/repo 42
+# => "open | mergeable: clean | ci: ✓ | https://github.com/..."
+
+# Get PR diff with line numbers
+gh-ai pr-diff owner/repo 42 --max-lines 100
+
+# Add a comment
+echo "LGTM" | gh-ai pr-comment owner/repo 42
+gh-ai pr-comment owner/repo 42 --body "Nice work"
+
+# Create an issue
+gh-ai issue-create owner/repo --title "Bug found" --body "Details here"
+gh-ai issue-create owner/repo --title "Bug" --label bug --label high-priority
 ```
 
 ## Token Efficiency Rules
