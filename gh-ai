@@ -32,7 +32,7 @@ try:
 except Exception:  # pragma: no cover
     _HAVE_NACL = False
 
-VERSION = "2.0.0"
+VERSION = "3.0.0"
 
 # ---------------------------------------------------------------------------
 # Config
@@ -209,6 +209,23 @@ def _encrypt_secret(public_key, value):
     key = nacl.public.PublicKey(base64.b64decode(public_key))
     box = nacl.public.SealedBox(key)
     return base64.b64encode(box.encrypt(value.encode("utf-8"))).decode("ascii")
+
+
+def _gql(query, variables=None):
+    """Run a GraphQL query. Returns the data object; exits on errors."""
+    _check_token()
+    payload = {"query": query}
+    if variables:
+        payload["variables"] = variables
+    resp = requests.post(f"{BASE_URL}/graphql", headers=_headers(), json=payload, timeout=60)
+    if resp.status_code >= 400:
+        _fail_status(resp, "/graphql")
+    data = resp.json()
+    if "errors" in data:
+        msgs = "; ".join(e.get("message", "?") for e in data["errors"])
+        click.echo(f"GraphQL error: {msgs}", err=True)
+        sys.exit(6)
+    return data.get("data", {})
 
 
 # ---------------------------------------------------------------------------
@@ -2564,6 +2581,1639 @@ def apply_patch(file_path):
             result = _apply_diff(file_path, patch_text)
 
     click.echo(result)
+
+
+# ===========================================================================
+# Activity & social
+# ===========================================================================
+@cli.command()
+@click.argument("repo")
+def star(repo):
+    """Star a repository."""
+    _request(f"/user/starred/{repo}", method="PUT")
+    click.echo(f"✓ Starred {repo}")
+
+
+@cli.command()
+@click.argument("repo")
+def unstar(repo):
+    """Unstar a repository."""
+    _request(f"/user/starred/{repo}", method="DELETE")
+    click.echo(f"✓ Unstarred {repo}")
+
+
+@cli.command()
+@click.option("--login", default=None, help="Show starred repos for a user (default: yours)")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def starred(login, max_items):
+    """List starred repositories."""
+    path = f"/users/{login}/starred" if login else "/user/starred"
+    items = _get_list(path, max_items=max_items, sort="updated")
+    if not items:
+        click.echo("(none)")
+        return
+    for r in items:
+        click.echo(_fmt_repo_line(r))
+
+
+@cli.command()
+@click.argument("repo")
+@click.option("--ignore", is_flag=True, default=False, help="Ignore (unwatch) the repo")
+def watch(repo, ignore):
+    """Watch a repository (subscribe to notifications)."""
+    if ignore:
+        payload = {"subscribed": False, "ignored": True}
+    else:
+        payload = {"subscribed": True, "ignored": False}
+    data = _request(f"/repos/{repo}/subscription", method="PUT", json=payload)
+    click.echo(f"✓ Watching {repo} (subscribed={data.get('subscribed', '?')})")
+
+
+@cli.command()
+@click.argument("repo")
+def unwatch(repo):
+    """Unwatch a repository."""
+    _request(f"/repos/{repo}/subscription", method="DELETE")
+    click.echo(f"✓ Unwatched {repo}")
+
+
+@cli.command(name="repo-watchers")
+@click.argument("repo")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def repo_watchers(repo, max_items):
+    """List repository watchers/subscribers."""
+    items = _get_list(f"/repos/{repo}/subscribers", max_items=max_items)
+    if not items:
+        click.echo("(none)")
+        return
+    for u in items:
+        click.echo(u.get("login", "?"))
+
+
+@cli.command()
+@click.argument("user")
+def follow(user):
+    """Follow a user."""
+    _request(f"/user/following/{user}", method="PUT")
+    click.echo(f"✓ Following {user}")
+
+
+@cli.command()
+@click.argument("user")
+def unfollow(user):
+    """Unfollow a user."""
+    _request(f"/user/following/{user}", method="DELETE")
+    click.echo(f"✓ Unfollowed {user}")
+
+
+@cli.command()
+@click.option("--login", default=None, help="List followers of this user (default: yours)")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def followers(login, max_items):
+    """List followers."""
+    path = f"/users/{login}/followers" if login else "/user/followers"
+    items = _get_list(path, max_items=max_items)
+    if not items:
+        click.echo("(none)")
+        return
+    for u in items:
+        click.echo(u.get("login", "?"))
+
+
+@cli.command()
+@click.option("--login", default=None, help="List users this user follows (default: yours)")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def following(login, max_items):
+    """List following."""
+    path = f"/users/{login}/following" if login else "/user/following"
+    items = _get_list(path, max_items=max_items)
+    if not items:
+        click.echo("(none)")
+        return
+    for u in items:
+        click.echo(u.get("login", "?"))
+
+
+@cli.command()
+@click.option("--login", default=None, help="User whose events to show (default: yours)")
+@click.option("--received", is_flag=True, default=False, help="Show received events")
+@click.option("--repo", "repo", default=None, help="Show events for a repo (o/r)")
+@click.option("--org", "org", default=None, help="Show events for an org")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def events(login, received, repo, org, max_items):
+    """List public events (user, repo, or org activity feed)."""
+    _check_token()
+    if org:
+        items = _get_list(f"/orgs/{org}/events", max_items=max_items)
+    elif repo:
+        items = _get_list(f"/repos/{repo}/events", max_items=max_items)
+    elif login:
+        path = f"/users/{login}/received_events" if received else f"/users/{login}/events"
+        items = _get_list(path, max_items=max_items)
+    else:
+        path = "/user/received_events" if received else "/user/events"
+        items = _get_list(path, max_items=max_items)
+    if not items:
+        click.echo("(none)")
+        return
+    for e in items:
+        actor = (e.get("actor") or {}).get("login", "?")
+        ev_type = e.get("type", "?").replace("Event", "")
+        created = _d(e.get("created_at"))
+        repo_name = (e.get("repo") or {}).get("name", "?")
+        payload = e.get("payload", {})
+        detail = ""
+        if "action" in payload:
+            detail = payload["action"]
+        elif ev_type == "Push":
+            detail = f"{len(payload.get('commits', []))} commits"
+        elif ev_type == "Issues" and payload.get("issue"):
+            detail = payload["issue"].get("title", "")
+        elif ev_type == "PullRequest" and payload.get("pull_request"):
+            detail = payload["pull_request"].get("title", "")
+        elif ev_type == "Create":
+            detail = f"{payload.get('ref_type', '')} {payload.get('ref', '')}".strip()
+        click.echo(f"{created} | {actor} | {ev_type} | {repo_name} | {detail}")
+
+
+# ===========================================================================
+# Repo administration
+# ===========================================================================
+@cli.command(name="repo-collab")
+@click.argument("repo")
+@click.option("--add", "add_user", default=None, help="Add collaborator")
+@click.option("--permission", default="push", help="Permission for --add: pull/push/admin/maintain/triage")
+@click.option("--remove", "remove_user", default=None, help="Remove collaborator")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results (list)")
+def repo_collab(repo, add_user, permission, remove_user, max_items):
+    """List, add, or remove repository collaborators."""
+    if add_user:
+        _request(f"/repos/{repo}/collaborators/{add_user}", method="PUT",
+                 json={"permission": permission})
+        click.echo(f"✓ Added {add_user} as {permission}")
+        return
+    if remove_user:
+        _request(f"/repos/{repo}/collaborators/{remove_user}", method="DELETE")
+        click.echo(f"✓ Removed {remove_user}")
+        return
+    items = _get_list(f"/repos/{repo}/collaborators", max_items=max_items)
+    if not items:
+        click.echo("(none)")
+        return
+    for c in items:
+        perms = c.get("permissions", {})
+        perm = next((k for k in ("admin", "maintain", "push", "triage", "pull") if perms.get(k)), "?")
+        click.echo(f"{c.get('login', '?')} | {perm}")
+
+
+@cli.command(name="repo-hook")
+@click.argument("repo")
+@click.option("--create", "hook_url", default=None, help="Webhook URL to create")
+@click.option("--events", default="push", help="Comma-separated events for --create")
+@click.option("--secret", default=None, help="Webhook secret for --create")
+@click.option("--delete", "delete_id", type=int, default=None, help="Webhook ID to delete")
+@click.option("--ping", "ping_id", type=int, default=None, help="Webhook ID to ping")
+@click.option("--active", is_flag=True, default=None, help="Mark webhook active (with --create)")
+def repo_hook(repo, hook_url, events, secret, delete_id, ping_id, active):
+    """Manage repository webhooks: list (default), --create, --delete, --ping."""
+    if delete_id:
+        _request(f"/repos/{repo}/hooks/{delete_id}", method="DELETE")
+        click.echo(f"✓ Webhook {delete_id} deleted")
+        return
+    if ping_id:
+        _request(f"/repos/{repo}/hooks/{ping_id}/pings", method="POST")
+        click.echo(f"✓ Ping sent to webhook {ping_id}")
+        return
+    if hook_url:
+        payload = {
+            "name": "web",
+            "config": {"url": hook_url, "content_type": "json"},
+            "events": [e.strip() for e in events.split(",") if e.strip()],
+        }
+        if secret:
+            payload["config"]["secret"] = secret
+        if active is not None:
+            payload["active"] = bool(active)
+        data = _request(f"/repos/{repo}/hooks", method="POST", json=payload)
+        click.echo(f"✓ Webhook created (id {data.get('id', '?')})")
+        return
+    items = _get_list(f"/repos/{repo}/hooks", max_items=DEFAULT_LIST)
+    if not items:
+        click.echo("(none)")
+        return
+    for h in items:
+        cfg = h.get("config", {})
+        url = cfg.get("url", "?")
+        events_str = ",".join(h.get("events", []))
+        active_str = "active" if h.get("active") else "inactive"
+        click.echo(f"{h.get('id', '?')} | {url} | {events_str} | {active_str}")
+
+
+@cli.command(name="repo-key")
+@click.argument("repo")
+@click.option("--add", "add_title", default=None, help="Deploy key title")
+@click.option("--key", "key_value", default=None, help="Public key for --add")
+@click.option("--read-only", is_flag=True, default=False, help="Read-only key (with --add)")
+@click.option("--delete", "delete_id", type=int, default=None, help="Deploy key ID to delete")
+def repo_key(repo, add_title, key_value, read_only, delete_id):
+    """Manage deploy keys: list (default), --add title --key, --delete ID."""
+    if delete_id:
+        _request(f"/repos/{repo}/keys/{delete_id}", method="DELETE")
+        click.echo(f"✓ Deploy key {delete_id} deleted")
+        return
+    if add_title:
+        if not key_value:
+            click.echo("--key required with --add", err=True)
+            sys.exit(1)
+        data = _request(f"/repos/{repo}/keys", method="POST",
+                        json={"title": add_title, "key": key_value, "read_only": bool(read_only)})
+        click.echo(f"✓ Deploy key added (id {data.get('id', '?')})")
+        return
+    items = _get_list(f"/repos/{repo}/keys", max_items=DEFAULT_LIST)
+    if not items:
+        click.echo("(none)")
+        return
+    for k in items:
+        ro = "ro" if k.get("read_only") else "rw"
+        click.echo(f"{k.get('id', '?')} | {k.get('title', '?')} | {ro}")
+
+
+@cli.command(name="branch-protect")
+@click.argument("repo")
+@click.argument("branch")
+@click.option("--require-reviews", "req_reviews", type=int, default=None, help="Required approving reviews")
+@click.option("--dismiss-stale", is_flag=True, default=False, help="Dismiss stale reviews")
+@click.option("--require-status", "req_status", is_flag=True, default=False, help="Require status checks")
+@click.option("--enforce-admins", is_flag=True, default=False, help="Enforce for admins")
+@click.option("--off", is_flag=True, default=False, help="Remove branch protection")
+def branch_protect(repo, branch, req_reviews, dismiss_stale, req_status, enforce_admins, off):
+    """Get or set branch protection rules."""
+    base = f"/repos/{repo}/branches/{branch}/protection"
+    if off:
+        _request(base, method="DELETE")
+        click.echo(f"✓ Protection removed from {branch}")
+        return
+    if req_reviews is None and not req_status and not enforce_admins and not dismiss_stale:
+        data = _request(base)
+        reviews = data.get("required_pull_request_reviews", {})
+        checks = data.get("required_status_checks", {})
+        admins = data.get("enforce_admins", {}).get("enabled", False)
+        click.echo(f"branch: {branch}")
+        click.echo(f"required reviews: {reviews.get('required_approving_review_count', 0)} | dismiss_stale: {reviews.get('dismiss_stale_reviews', False)}")
+        click.echo(f"required status checks: {len(checks.get('contexts', []))} | enforce_admins: {admins}")
+        click.echo(f"restrictions: {'yes' if data.get('restrictions') else 'no'}")
+        return
+    payload = {
+        "required_pull_request_reviews": {
+            "required_approving_review_count": req_reviews if req_reviews is not None else 0,
+            "dismiss_stale_reviews": bool(dismiss_stale),
+        },
+        "required_status_checks": {"strict": False, "contexts": []} if req_status else None,
+        "enforce_admins": bool(enforce_admins),
+        "restrictions": None,
+    }
+    data = _request(base, method="PUT", json=payload,
+                    accept="application/vnd.github.luke-cage-preview+json")
+    click.echo(f"✓ Protection set on {branch} (reviews={req_reviews or 0})")
+
+
+@cli.command(name="ruleset-list")
+@click.argument("target")
+@click.option("--org", "org_name", default=None, help="List org rulesets (target=org name)")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def ruleset_list(target, org_name, max_items):
+    """List rulesets. Pass owner/repo, or an org name with --org."""
+    accept = "application/vnd.github+json"
+    if org_name:
+        items = _get_list(f"/orgs/{target}/rulesets", max_items=max_items, extract_keys=("rulesets",))
+        owner_label = target
+    else:
+        items = _get_list(f"/repos/{target}/rulesets", max_items=max_items, extract_keys=("rulesets",))
+        owner_label = target
+    if not items:
+        click.echo("(none)")
+        return
+    for r in items:
+        click.echo(f"{r.get('id', '?')} | {r.get('name', '?')} | {r.get('enforcement', '?')} | {r.get('target', '?')}")
+
+
+@cli.command(name="ruleset-delete")
+@click.argument("target")
+@click.argument("ruleset_id", type=int)
+@click.option("--org", "org_name", is_flag=True, default=False, help="Target is an org")
+@click.option("--yes", is_flag=True, default=False, help="Confirm deletion (required)")
+def ruleset_delete(target, ruleset_id, org_name, yes):
+    """Delete a ruleset (requires --yes)."""
+    if not yes:
+        click.echo("Add --yes to confirm ruleset deletion.", err=True)
+        sys.exit(1)
+    base = f"/orgs/{target}" if org_name else f"/repos/{target}"
+    _request(f"{base}/rulesets/{ruleset_id}", method="DELETE")
+    click.echo(f"✓ Ruleset {ruleset_id} deleted")
+
+
+@cli.command(name="repo-transfer")
+@click.argument("repo")
+@click.argument("new_owner")
+def repo_transfer(repo, new_owner):
+    """Transfer a repository to another owner."""
+    data = _request(f"/repos/{repo}/transfer", method="POST", json={"new_owner": new_owner})
+    click.echo(f"✓ Transfer initiated: {data.get('full_name', repo)}")
+
+
+@cli.command(name="repo-generate")
+@click.argument("template")
+@click.argument("name")
+@click.option("--owner", "owner", default=None, help="Destination owner (default: you)")
+@click.option("--description", default=None, help="New repo description")
+@click.option("--private", "private_", is_flag=True, default=False, help="Create private")
+def repo_generate(template, name, owner, description, private_):
+    """Create a repository from a template repository."""
+    payload = {"name": name, "private": bool(private_)}
+    if owner:
+        payload["owner"] = owner
+    if description is not None:
+        payload["description"] = description
+    data = _request(f"/repos/{template}/generate", method="POST", json=payload)
+    click.echo(f"✓ Generated: {data.get('full_name', '?')}")
+
+
+@cli.command(name="merge-upstream")
+@click.argument("repo")
+@click.argument("branch")
+def merge_upstream(repo, branch):
+    """Sync a fork: merge upstream default branch into your branch."""
+    data = _request(f"/repos/{repo}/merge-upstream", method="POST", json={"branch": branch})
+    msg = data.get("message", "?")
+    merged = data.get("merge_commit_sha", "")
+    click.echo(f"✓ {msg} {_sha7(merged)}".strip())
+
+
+@cli.command(name="merge-commit")
+@click.argument("repo")
+@click.argument("base")
+@click.argument("head")
+@click.option("--message", "commit_message", default=None, help="Commit message")
+def merge_commit(repo, base, head, commit_message):
+    """Create a merge commit via the API (base <- head)."""
+    payload = {"base": base, "head": head}
+    if commit_message:
+        payload["commit_message"] = commit_message
+    data = _request(f"/repos/{repo}/merges", method="POST", json=payload)
+    click.echo(f"✓ Merged {base} <- {head} | {_sha7(data.get('sha', ''))}")
+
+
+@cli.command(name="repo-dl")
+@click.argument("repo")
+@click.option("--ref", "ref", default=None, help="Branch/tag/SHA (default: default branch)")
+@click.option("--zip", "zip_fmt", is_flag=True, default=False, help="Download zipball (default tarball)")
+@click.option("--out", "out_path", default=None, help="Output file path")
+def repo_dl(repo, ref, zip_fmt, out_path):
+    """Download a repository archive (tarball or zipball)."""
+    _check_token()
+    fmt = "zipball" if zip_fmt else "tarball"
+    ref = ref or ""
+    url = f"{BASE_URL}/repos/{repo}/{fmt}/{ref}"
+    resp = requests.get(url, headers=_headers(), allow_redirects=True, timeout=120)
+    if resp.status_code >= 400:
+        _fail_status(resp, f"/repos/{repo}/{fmt}")
+    if not out_path:
+        fname = repo.replace("/", "-") + ("-" + ref if ref else "") + (".zip" if zip_fmt else ".tar.gz")
+        out_path = fname
+    with open(out_path, "wb") as f:
+        f.write(resp.content)
+    click.echo(f"✓ Saved {out_path} ({len(resp.content)} bytes)")
+
+
+@cli.command(name="repo-stats")
+@click.argument("repo")
+@click.option("--type", "stat_type", type=click.Choice(["contributors", "commit-activity", "code-frequency",
+                                                        "participation", "punch-card"]),
+              default="contributors", help="Statistic type")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def repo_stats(repo, stat_type, max_items):
+    """Repository statistics (contributors, commit activity, code frequency, participation, punch card)."""
+    try:
+        data = _request(f"/repos/{repo}/stats/{stat_type}")
+    except SystemExit:
+        click.echo("(no data yet — GitHub computes statistics asynchronously; retry shortly)")
+        return
+    if not data:
+        click.echo("(no data yet — GitHub computes statistics asynchronously; retry shortly)")
+        return
+    if stat_type == "contributors":
+        for c in data[:max_items]:
+            weeks = c.get("weeks", [])
+            total = sum(w.get("c", 0) for w in weeks)
+            click.echo(f"{c.get('author', {}).get('login', '?')}: {total} commits")
+    elif stat_type == "commit-activity":
+        for w in data:
+            click.echo(f"{w.get('week', 0)} | {w.get('total', 0)} commits")
+    elif stat_type == "code-frequency":
+        for wk in data[:max_items]:
+            click.echo(f"week {wk[0]} | +{wk[1]} -{wk[2]}")
+    elif stat_type == "participation":
+        all_c = data.get("all", [])
+        owner_c = data.get("owner", [])
+        if all_c:
+            click.echo(f"all: {sum(all_c)} commits over {len(all_c)} weeks")
+            click.echo(f"owner: {sum(owner_c)} commits")
+    elif stat_type == "punch-card":
+        days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        for day, hour, count in data:
+            click.echo(f"{days[day]} {hour:02d}:00 | {count} commits")
+
+
+@cli.command(name="repo-traffic")
+@click.argument("repo")
+def repo_traffic(repo):
+    """Repository traffic (views + clones; requires push access)."""
+    try:
+        views = _request(f"/repos/{repo}/traffic/views")
+        click.echo(f"views: {views.get('count', 0)} unique {views.get('uniques', 0)}")
+        for v in views.get("views", [])[:7]:
+            click.echo(f"  {_d(v.get('timestamp'))}: {v.get('count')} views ({v.get('uniques')} unique)")
+    except SystemExit:
+        pass
+    try:
+        clones = _request(f"/repos/{repo}/traffic/clones")
+        click.echo(f"clones: {clones.get('count', 0)} unique {clones.get('uniques', 0)}")
+        for c in clones.get("clones", [])[:7]:
+            click.echo(f"  {_d(c.get('timestamp'))}: {c.get('count')} clones ({c.get('uniques')} unique)")
+    except SystemExit:
+        pass
+
+
+@cli.command(name="repo-community")
+@click.argument("repo")
+def repo_community(repo):
+    """Repository community profile (health percentage, files)."""
+    data = _request(f"/repos/{repo}/community/profile")
+    click.echo(f"health: {data.get('health_percentage', '?')}%")
+    for f in data.get("files", []):
+        if isinstance(f, dict):
+            click.echo(f"{f.get('name', '?')}: {f.get('content_type', '?')} | present={f.get('html_url') is not None}")
+
+
+@cli.command(name="codeowners")
+@click.argument("repo")
+@click.option("--ref", "ref", default=None, help="Branch/SHA")
+def codeowners(repo, ref):
+    """CODEOWNERS errors for a repository."""
+    qs = f"?ref={urllib.parse.quote(ref)}" if ref else ""
+    try:
+        data = _request(f"/repos/{repo}/codeowners/errors{qs}")
+    except SystemExit:
+        click.echo("(no CODEOWNERS file in this repo)")
+        return
+    errors = data.get("errors", [])
+    if not errors:
+        click.echo("(no CODEOWNERS errors)")
+        return
+    for e in errors:
+        line = e.get("line", "?")
+        kind = e.get("kind", "?")
+        source = e.get("source", "?")
+        click.echo(f"line {line} | {kind} | {source}")
+
+
+# ===========================================================================
+# Git data
+# ===========================================================================
+@cli.command(name="git-refs")
+@click.argument("repo")
+@click.option("--ref", "ref", default=None, help="Filter: heads/main, tags/v1.0, etc.")
+@click.option("--max", "max_items", type=int, default=100, help="Max results")
+def git_refs(repo, ref, max_items):
+    """List git refs (branches/tags)."""
+    path = f"/repos/{repo}/git/matching-refs/{ref}" if ref else f"/repos/{repo}/git/refs"
+    items = _get_list(path, max_items=max_items)
+    if not items:
+        click.echo("(none)")
+        return
+    for r in items:
+        obj = r.get("object", {})
+        click.echo(f"{r.get('ref', '?')} -> {_sha7(obj.get('sha'))} ({obj.get('type', '?')})")
+
+
+@cli.command(name="git-ref-create")
+@click.argument("repo")
+@click.argument("ref")
+@click.argument("sha")
+def git_ref_create(repo, ref, sha):
+    """Create a git ref (e.g. refs/heads/new-branch)."""
+    data = _request(f"/repos/{repo}/git/refs", method="POST",
+                    json={"ref": ref, "sha": sha})
+    click.echo(f"✓ {data.get('ref', ref)} -> {_sha7(data.get('object', {}).get('sha', ''))}")
+
+
+@cli.command(name="git-ref-delete")
+@click.argument("repo")
+@click.argument("ref")
+@click.option("--yes", is_flag=True, default=False, help="Confirm deletion (required)")
+def git_ref_delete(repo, ref, yes):
+    """Delete a git ref (e.g. refs/heads/old-branch)."""
+    if not yes:
+        click.echo("Add --yes to confirm ref deletion.", err=True)
+        sys.exit(1)
+    _request(f"/repos/{repo}/git/{ref}", method="DELETE")
+    click.echo(f"✓ Deleted {ref}")
+
+
+@cli.command(name="git-blob")
+@click.argument("repo")
+@click.argument("sha")
+def git_blob(repo, sha):
+    """Show a git blob (file content from the git database)."""
+    data = _request(f"/repos/{repo}/git/blobs/{sha}")
+    content = data.get("content", "")
+    encoding = data.get("encoding", "utf-8")
+    try:
+        text = base64.b64decode(content).decode("utf-8", errors="replace") if encoding == "base64" else content
+    except Exception:
+        text = "(binary)"
+    lines = text.splitlines()
+    for i, line in enumerate(lines[:MAX_FILE_LINES], 1):
+        click.echo(f"{i}: {line}")
+    if len(lines) > MAX_FILE_LINES:
+        click.echo(f"... (truncated: {len(lines) - MAX_FILE_LINES} more lines)")
+
+
+@cli.command(name="git-tree")
+@click.argument("repo")
+@click.argument("sha")
+def git_tree(repo, sha):
+    """Show a git tree."""
+    data = _request(f"/repos/{repo}/git/trees/{sha}")
+    click.echo(f"tree {_sha7(data.get('sha', ''))} | truncated={data.get('truncated', False)}")
+    for item in data.get("tree", []):
+        kind = item.get("type", "?")
+        click.echo(f"{kind} {item.get('path', '?')} {_sha7(item.get('sha'))}")
+
+
+@cli.command(name="status-create")
+@click.argument("repo")
+@click.argument("sha")
+@click.option("--state", required=True, type=click.Choice(["pending", "success", "failure", "error"]),
+              help="Status state")
+@click.option("--context", default="gh-ai", help="Status context name")
+@click.option("--description", default=None, help="Status description")
+@click.option("--target", default=None, help="Target URL")
+def status_create(repo, sha, state, context, description, target):
+    """Create a commit status (e.g. CI signal)."""
+    payload = {"state": state, "context": context}
+    if description:
+        payload["description"] = description
+    if target:
+        payload["target_url"] = target
+    data = _request(f"/repos/{repo}/statuses/{sha}", method="POST", json=payload)
+    click.echo(f"✓ Status {state} set ({data.get('context', context)})")
+
+
+@cli.command(name="check-runs")
+@click.argument("repo")
+@click.argument("sha")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def check_runs(repo, sha, max_items):
+    """List check runs for a commit SHA."""
+    items = _get_list(f"/repos/{repo}/commits/{sha}/check-runs", max_items=max_items)
+    click.echo(_format_checks(items))
+
+
+# ===========================================================================
+# Deployments, pages, artifacts
+# ===========================================================================
+@cli.command(name="deploy-list")
+@click.argument("repo")
+@click.option("--environment", default=None, help="Filter by environment")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def deploy_list(repo, environment, max_items):
+    """List deployments."""
+    params = {}
+    if environment:
+        params["environment"] = environment
+    items = _get_list(f"/repos/{repo}/deployments", max_items=max_items, **params)
+    if not items:
+        click.echo("(none)")
+        return
+    for d in items:
+        creator = _login(d.get("creator"))
+        env = d.get("environment", "?")
+        sha = _sha7(d.get("sha"))
+        click.echo(f"{d.get('id', '?')} | {env} | {sha} | {d.get('description') or d.get('ref', '?')} | {creator} | {_d(d.get('created_at'))}")
+
+
+@cli.command(name="deploy-create")
+@click.argument("repo")
+@click.argument("ref")
+@click.option("--environment", default=None, help="Environment name")
+@click.option("--description", default=None, help="Deployment description")
+@click.option("--auto-merge", "auto_merge", is_flag=True, default=False, help="Auto-merge default branch")
+def deploy_create(repo, ref, environment, description, auto_merge):
+    """Create a deployment."""
+    payload = {"ref": ref, "auto_merge": bool(auto_merge)}
+    if environment:
+        payload["environment"] = environment
+    if description:
+        payload["description"] = description
+    data = _request(f"/repos/{repo}/deployments", method="POST", json=payload)
+    click.echo(f"✓ Deployment #{data.get('id', '?')} created for {ref}")
+
+
+@cli.command(name="deploy-status")
+@click.argument("repo")
+@click.argument("deployment_id", type=int)
+@click.option("--state", type=click.Choice(["pending", "success", "failure", "inactive", "in_progress", "queued"]),
+              default=None, help="Set status state")
+@click.option("--description", default=None, help="Status description")
+@click.option("--environment", default=None, help="Environment URL")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max statuses")
+def deploy_status(repo, deployment_id, state, description, environment, max_items):
+    """List deployment statuses, or create one with --state."""
+    if state:
+        payload = {"state": state}
+        if description:
+            payload["description"] = description
+        if environment:
+            payload["environment_url"] = environment
+        data = _request(f"/repos/{repo}/deployments/{deployment_id}/statuses", method="POST", json=payload)
+        click.echo(f"✓ Status {state} set (id {data.get('id', '?')})")
+        return
+    items = _get_list(f"/repos/{repo}/deployments/{deployment_id}/statuses", max_items=max_items)
+    if not items:
+        click.echo("(none)")
+        return
+    for s in items:
+        click.echo(f"{s.get('state', '?')} | {s.get('description') or ''} | {_d(s.get('created_at'))}")
+
+
+@cli.command()
+@click.argument("repo")
+def pages(repo):
+    """Show GitHub Pages site info and latest build."""
+    try:
+        p = _request(f"/repos/{repo}/pages")
+        click.echo(f"status: {p.get('status', '?')} | branch: {p.get('source', {}).get('branch', '?')} | path: {p.get('source', {}).get('path', '/')}")
+        click.echo(f"cname: {p.get('cname') or '(none)'} | custom_404: {p.get('custom_404', False)} | https: {p.get('https_certificate', {}).get('state', '?')}")
+        if p.get("html_url"):
+            click.echo(f"url: {p['html_url']}")
+    except SystemExit:
+        click.echo("(GitHub Pages not enabled for this repo)")
+        return
+    try:
+        builds = _get_list(f"/repos/{repo}/pages/builds", max_items=3)
+        for b in builds:
+            status = b.get("status", "?")
+            error = b.get("error", {})
+            err_msg = error.get("message", "") if error else ""
+            click.echo(f"build: {status} | {b.get('commit', '')[:7]} | {_d(b.get('created_at'))} {err_msg}")
+    except SystemExit:
+        pass
+
+
+@cli.command(name="pages-build")
+@click.argument("repo")
+def pages_build(repo):
+    """Request a GitHub Pages build."""
+    data = _request(f"/repos/{repo}/pages/builds", method="POST")
+    click.echo(f"✓ Build requested (status {data.get('status', '?')})")
+
+
+@cli.command(name="artifact-list")
+@click.argument("repo")
+@click.option("--run-id", default=None, help="Filter by workflow run ID")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def artifact_list(repo, run_id, max_items):
+    """List workflow run artifacts."""
+    params = {}
+    if run_id:
+        params["run_id"] = run_id
+    items = _get_list(f"/repos/{repo}/actions/artifacts", max_items=max_items, **params)
+    if not items:
+        click.echo("(none)")
+        return
+    for a in items:
+        click.echo(f"{a.get('id', '?')} | {a.get('name', '?')} | {a.get('size_in_bytes', 0)} bytes | {_d(a.get('created_at'))} | expired={a.get('expired', False)}")
+
+
+@cli.command(name="artifact-dl")
+@click.argument("repo")
+@click.argument("artifact_id", type=int)
+@click.option("--out", "out_path", default=None, help="Output zip path")
+def artifact_dl(repo, artifact_id, out_path):
+    """Download a workflow artifact as a zip."""
+    _check_token()
+    url = f"{BASE_URL}/repos/{repo}/actions/artifacts/{artifact_id}/zip"
+    resp = requests.get(url, headers=_headers(), allow_redirects=True, timeout=120)
+    if resp.status_code >= 400:
+        _fail_status(resp, f"/repos/{repo}/actions/artifacts/{artifact_id}/zip")
+    if not out_path:
+        out_path = f"artifact-{artifact_id}.zip"
+    with open(out_path, "wb") as f:
+        f.write(resp.content)
+    click.echo(f"✓ Saved {out_path} ({len(resp.content)} bytes)")
+
+
+# ===========================================================================
+# Security
+# ===========================================================================
+@cli.command()
+@click.argument("repo")
+@click.option("--state", default=None, help="Filter: open/dismissed/fixed")
+@click.option("--severity", default=None, help="Filter: critical/high/medium/low")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def dependabot(repo, state, severity, max_items):
+    """List Dependabot alerts."""
+    params = {}
+    if state:
+        params["state"] = state
+    if severity:
+        params["severity"] = severity
+    items = _get_list(f"/repos/{repo}/dependabot/alerts", max_items=max_items, **params)
+    if not items:
+        click.echo("(none)")
+        return
+    for a in items:
+        adv = a.get("security_advisory", {})
+        vuln = a.get("security_vulnerability", {})
+        pkg = vuln.get("package", {}).get("name", "?")
+        sev = vuln.get("severity", "?")
+        eco = vuln.get("ecosystem", "?")
+        click.echo(f"{a.get('number', '?')} | {pkg} ({eco}) | {sev} | {adv.get('ghsa_id', '?')} | {a.get('state', '?')}")
+
+
+@cli.command(name="code-scan")
+@click.argument("repo")
+@click.option("--state", default=None, help="Filter: open/dismissed/fixed")
+@click.option("--severity", default=None, help="Filter: critical/high/medium/low/error/warning/note")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def code_scan(repo, state, severity, max_items):
+    """List code scanning alerts."""
+    params = {}
+    if state:
+        params["state"] = state
+    if severity:
+        params["severity"] = severity
+    items = _get_list(f"/repos/{repo}/code-scanning/alerts", max_items=max_items, **params)
+    if not items:
+        click.echo("(none)")
+        return
+    for a in items:
+        rule = a.get("rule", {})
+        tool = a.get("tool", {}).get("name", "?")
+        loc = a.get("most_recent_instance", {}).get("location", {}).get("path", "?")
+        click.echo(f"{a.get('number', '?')} | {tool} | {rule.get('severity', '?')} | {rule.get('name', '?')} | {loc} | {a.get('state', '?')}")
+
+
+@cli.command(name="secret-scan")
+@click.argument("repo")
+@click.option("--state", default=None, help="Filter: open/resolved")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def secret_scan(repo, state, max_items):
+    """List secret scanning alerts."""
+    params = {}
+    if state:
+        params["state"] = state
+    items = _get_list(f"/repos/{repo}/secret-scanning/alerts", max_items=max_items, **params)
+    if not items:
+        click.echo("(none)")
+        return
+    for a in items:
+        sec = a.get("secret_type_display_name", a.get("secret_type", "?"))
+        loc = a.get("location", {}).get("path", "?")
+        click.echo(f"{a.get('number', '?')} | {sec} | {loc} | {a.get('state', '?')}")
+
+
+@cli.command(name="vuln-alert")
+@click.argument("repo")
+@click.option("--enable", "enable", is_flag=True, default=False, help="Enable vulnerability alerts")
+@click.option("--disable", "disable", is_flag=True, default=False, help="Disable vulnerability alerts")
+def vuln_alert(repo, enable, disable):
+    """Enable or disable Dependabot vulnerability alerts."""
+    if enable == disable:
+        click.echo("Pass exactly one of --enable or --disable", err=True)
+        sys.exit(1)
+    method = "PUT" if enable else "DELETE"
+    _request(f"/repos/{repo}/vulnerability-alerts", method=method,
+             accept="application/vnd.github.dorian-preview+json")
+    click.echo(f"✓ Vulnerability alerts {'enabled' if enable else 'disabled'}")
+
+
+@cli.command(name="advisory-list")
+@click.argument("target", required=False)
+@click.option("--org", "org_name", default=None, help="List org advisories (target=org name)")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def advisory_list(target, org_name, max_items):
+    """List repository or org security advisories."""
+    if org_name and target:
+        items = _get_list(f"/orgs/{target}/security-advisories", max_items=max_items)
+        label = target
+    elif target:
+        items = _get_list(f"/repos/{target}/security-advisories", max_items=max_items)
+        label = target
+    else:
+        click.echo("Pass owner/repo, or an org name with --org", err=True)
+        sys.exit(1)
+    if not items:
+        click.echo("(none)")
+        return
+    for a in items:
+        click.echo(f"{a.get('ghsa_id', '?')} | {a.get('severity', '?')} | {a.get('state', '?')} | {a.get('summary', '?')[:80]}")
+
+
+@cli.command(name="advisory-view")
+@click.argument("repo")
+@click.argument("ghsa_id")
+def advisory_view(repo, ghsa_id):
+    """View a repository security advisory."""
+    a = _request(f"/repos/{repo}/security-advisories/{ghsa_id}")
+    click.echo(f"GHSA: {a.get('ghsa_id', '?')} | {a.get('severity', '?')} | {a.get('state', '?')} | {a.get('cve_id') or 'no CVE'}")
+    click.echo(f"summary: {a.get('summary', '?')}")
+    click.echo(f"published: {_d(a.get('published_at'))} | updated: {_d(a.get('updated_at'))}")
+    if a.get("description"):
+        click.echo(f"description: {a['description'][:300]}")
+
+
+# ===========================================================================
+# Packages & wiki
+# ===========================================================================
+@cli.command(name="package-list")
+@click.option("--owner", default=None, help="User packages (default: you)")
+@click.option("--org", "org_name", default=None, help="Org packages")
+@click.option("--repo", "repo_name", default=None, help="Repo packages (o/r)")
+@click.option("--type", "pkg_type", default=None, help="npm/maven/rubygems/docker/container/nuget")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def package_list(owner, org_name, repo_name, pkg_type, max_items):
+    """List packages for a user, org, or repository. --type optional (all types when omitted)."""
+    all_types = ["container", "npm", "maven", "rubygems", "docker", "nuget"]
+    types = [pkg_type] if pkg_type else all_types
+    found = []
+    for t in types:
+        params = {"package_type": t}
+        if repo_name:
+            items = _get_list(f"/repos/{repo_name}/packages", max_items=max_items, **params)
+        elif org_name:
+            items = _get_list(f"/orgs/{org_name}/packages", max_items=max_items, **params)
+        else:
+            path = f"/users/{owner}/packages" if owner else "/user/packages"
+            items = _get_list(path, max_items=max_items, **params)
+        found.extend(items)
+        if len(found) >= max_items:
+            break
+    if not found:
+        click.echo("(none)")
+        return
+    for pk in found[:max_items]:
+        click.echo(f"{pk.get('package_type', '?')} | {pk.get('name', '?')} | {pk.get('visibility', '?')} | {_d(pk.get('updated_at'))}")
+
+
+@cli.command(name="package-view")
+@click.argument("owner")
+@click.argument("pkg_type")
+@click.argument("name")
+@click.option("--max", "max_items", type=int, default=5, help="Max versions")
+def package_view(owner, pkg_type, name, max_items):
+    """Show a package and its versions."""
+    data = _request(f"/users/{owner}/packages/{pkg_type}/{name}")
+    click.echo(f"{data.get('name', '?')} | {data.get('package_type', '?')} | {data.get('visibility', '?')}")
+    if data.get("description"):
+        click.echo(f"description: {data['description']}")
+    versions = _get_list(f"/users/{owner}/packages/{pkg_type}/{name}/versions", max_items=max_items)
+    for v in versions:
+        click.echo(f"v: {v.get('name', '?')} | {_d(v.get('created_at'))}")
+
+
+@cli.command()
+@click.argument("repo")
+@click.option("--read", "page_name", default=None, help="Read a wiki page")
+@click.option("--out", "out_dir", default=None, help="Clone wiki into this dir (default: temp)")
+def wiki(repo, page_name, out_dir):
+    """List or read wiki pages (shallow clone of the .wiki git repo)."""
+    import tempfile
+    tmp = out_dir or tempfile.mkdtemp(prefix="ghai-wiki-")
+    url = f"https://github.com/{repo}.wiki.git"
+    result = subprocess.run(["git", "clone", "--depth", "1", url, tmp],
+                            capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        click.echo(f"Wiki clone failed: {result.stderr.strip()[:200]}", err=True)
+        sys.exit(7)
+    if page_name:
+        wiki_exts = (".md", ".mediawiki", ".rst", ".asciidoc", ".org", ".textile", ".home", "")
+        for fname in sorted(os.listdir(tmp)):
+            base, ext = os.path.splitext(fname)
+            if base == page_name and ext in wiki_exts:
+                with open(os.path.join(tmp, fname), "r") as f:
+                    text = f.read()
+                lines = text.splitlines()
+                for i, line in enumerate(lines[:MAX_FILE_LINES], 1):
+                    click.echo(f"{i}: {line}")
+                if len(lines) > MAX_FILE_LINES:
+                    click.echo("... (truncated)")
+                return
+        click.echo(f"Page not found: {page_name}", err=True)
+        sys.exit(1)
+    for fname in sorted(os.listdir(tmp)):
+        if fname.endswith((".md", ".mediawiki", ".rst", ".asciidoc", ".org", ".textile")):
+            size = os.path.getsize(os.path.join(tmp, fname))
+            click.echo(f"{fname} ({size} bytes)")
+
+
+# ===========================================================================
+# Misc
+# ===========================================================================
+@cli.command()
+def feeds():
+    """Show Atom/RSS feed URLs."""
+    data = _request("/feeds")
+    for key, val in data.items():
+        if isinstance(val, str) and val.startswith("http"):
+            click.echo(f"{key}: {val}")
+
+
+@cli.command()
+def zen():
+    """Show a random Zen-of-GitHub quote."""
+    text = _request("/zen", raw=True)
+    click.echo(text)
+
+
+@cli.command()
+def emojis():
+    """Show count of available emoji shortcodes."""
+    data = _request("/emojis")
+    click.echo(f"{len(data)} emoji shortcodes available")
+
+
+@cli.command()
+@click.argument("text")
+@click.option("--file", "text_file", default=None, help="Read markdown from file")
+@click.option("--mode", default="markdown", help="markdown or gfm")
+def markdown(text, text_file, mode):
+    """Render markdown to HTML via the GitHub API."""
+    if text_file:
+        try:
+            with open(text_file, "r") as f:
+                text = f.read()
+        except OSError as e:
+            click.echo(f"Cannot read file: {e}", err=True)
+            sys.exit(1)
+    accept = "application/vnd.github+json"
+    data = _request("/markdown", method="POST",
+                    json={"text": text, "mode": mode}, accept=accept)
+    click.echo(data)
+
+
+@cli.command(name="gist-star")
+@click.argument("gist_id")
+def gist_star(gist_id):
+    """Star a gist."""
+    _request(f"/gists/{gist_id}/star", method="PUT")
+    click.echo(f"✓ Starred gist {gist_id}")
+
+
+@cli.command(name="gist-unstar")
+@click.argument("gist_id")
+def gist_unstar(gist_id):
+    """Unstar a gist."""
+    _request(f"/gists/{gist_id}/star", method="DELETE")
+    click.echo(f"✓ Unstarred gist {gist_id}")
+
+
+@cli.command(name="gist-fork")
+@click.argument("gist_id")
+def gist_fork(gist_id):
+    """Fork a gist."""
+    data = _request(f"/gists/{gist_id}/forks", method="POST")
+    click.echo(f"✓ Forked gist: {data.get('id', '?')}")
+
+
+@cli.command(name="user-keys")
+@click.option("--login", default=None, help="User's public SSH keys (default: yours)")
+def user_keys(login):
+    """List SSH keys."""
+    path = f"/users/{login}/keys" if login else "/user/keys"
+    items = _get_list(path, max_items=100)
+    if not items:
+        click.echo("(none)")
+        return
+    for k in items:
+        key = k.get("key", "")[:40] + "..."
+        click.echo(f"{k.get('id', '?')} | {k.get('title', '?')} | {key}")
+
+
+@cli.command(name="user-emails")
+def user_emails():
+    """List authenticated user's email addresses."""
+    items = _get_list("/user/emails", max_items=100)
+    if not items:
+        click.echo("(none)")
+        return
+    for e in items:
+        click.echo(f"{e.get('email', '?')} | primary={e.get('primary', False)} | verified={e.get('verified', False)}")
+
+
+@cli.command(name="org-invite")
+@click.argument("org")
+@click.argument("invitee")
+@click.option("--role", default="direct_member", help="direct_member/admin/billing_manager")
+@click.option("--team", "team_ids", multiple=True, type=int, help="Team IDs to add to (repeatable)")
+def org_invite(org, invitee, role, team_ids):
+    """Invite a user to an organization."""
+    payload = {"invitee_id": invitee, "role": role}
+    if team_ids:
+        payload["team_ids"] = list(team_ids)
+    data = _request(f"/orgs/{org}/invitations", method="POST", json=payload)
+    click.echo(f"✓ Invitation created (id {data.get('id', '?')})")
+
+
+@cli.command(name="org-outside")
+@click.argument("org")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def org_outside(org, max_items):
+    """List outside collaborators of an organization."""
+    items = _get_list(f"/orgs/{org}/outside_collaborators", max_items=max_items)
+    if not items:
+        click.echo("(none or no access)")
+        return
+    for u in items:
+        click.echo(u.get("login", "?"))
+
+
+@cli.command(name="org-blocks")
+@click.argument("org")
+@click.option("--block", "block_user", default=None, help="Block a user from the org")
+@click.option("--unblock", "unblock_user", default=None, help="Unblock a user")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results (list)")
+def org_blocks(org, block_user, unblock_user, max_items):
+    """Manage org user blocks."""
+    if block_user:
+        _request(f"/orgs/{org}/blocks/{block_user}", method="PUT")
+        click.echo(f"✓ Blocked {block_user}")
+        return
+    if unblock_user:
+        _request(f"/orgs/{org}/blocks/{unblock_user}", method="DELETE")
+        click.echo(f"✓ Unblocked {unblock_user}")
+        return
+    items = _get_list(f"/orgs/{org}/blocks", max_items=max_items)
+    if not items:
+        click.echo("(none or no access)")
+        return
+    for u in items:
+        click.echo(u.get("login", "?"))
+
+
+@cli.command(name="team-members")
+@click.argument("org")
+@click.argument("team")
+@click.option("--role", default=None, help="all/maintainer/member")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def team_members(org, team, role, max_items):
+    """List team members."""
+    params = {}
+    if role:
+        params["role"] = role
+    items = _get_list(f"/orgs/{org}/teams/{team}/members", max_items=max_items, **params)
+    if not items:
+        click.echo("(none or no access)")
+        return
+    for m in items:
+        click.echo(m.get("login", "?"))
+
+
+@cli.command(name="team-repos")
+@click.argument("org")
+@click.argument("team")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def team_repos(org, team, max_items):
+    """List team repositories."""
+    items = _get_list(f"/orgs/{org}/teams/{team}/repos", max_items=max_items)
+    if not items:
+        click.echo("(none or no access)")
+        return
+    for r in items:
+        click.echo(f"{r.get('full_name', '?')} | {r.get('permissions', {}).get('push', False)}")
+
+
+@cli.command(name="notif-sub")
+@click.argument("repo")
+def notif_sub(repo):
+    """Show repository watch state."""
+    try:
+        data = _request(f"/repos/{repo}/subscription")
+    except SystemExit:
+        click.echo("(not watching — no explicit subscription)")
+        return
+    click.echo(f"subscribed: {data.get('subscribed', '?')} | ignored: {data.get('ignored', '?')} | reason: {data.get('reason', '?')}")
+
+
+# ===========================================================================
+# GitHub Agents (web: repo 'Agents' tab)
+# ===========================================================================
+@cli.command(name="agent-tasks")
+@click.argument("repo")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def agent_tasks(repo, max_items):
+    """List GitHub Agent tasks for a repository."""
+    items = _get_list(f"/agents/repos/{repo}/tasks", max_items=max_items)
+    if not items:
+        click.echo("(none)")
+        return
+    for t in items:
+        state = t.get("state", t.get("status", "?"))
+        click.echo(f"{t.get('id', '?')} | {t.get('title') or t.get('name', '?')} | {state} | {_d(t.get('created_at'))}")
+
+
+@cli.command(name="agent-task")
+@click.argument("repo")
+@click.argument("task_id")
+def agent_task(repo, task_id):
+    """View a GitHub Agent task."""
+    t = _request(f"/agents/repos/{repo}/tasks/{task_id}")
+    click.echo(f"task: {t.get('id', '?')} | {t.get('title') or t.get('name', '?')}")
+    click.echo(f"state: {t.get('state', t.get('status', '?'))} | created: {_d(t.get('created_at'))}")
+    for key in ("summary", "body", "result", "error_message"):
+        if t.get(key):
+            click.echo(f"{key}: {str(t[key])[:300]}")
+
+
+@cli.command(name="agent-secret")
+@click.argument("repo")
+@click.option("--set", "secret_name", default=None, help="Secret name to set")
+@click.option("--value", default=None, help="Secret value (for --set)")
+@click.option("--delete", "delete_name", default=None, help="Secret name to delete")
+def agent_secret(repo, secret_name, value, delete_name):
+    """Manage GitHub Agents secrets: list (default), --set, --delete."""
+    if delete_name:
+        _request(f"/repos/{repo}/agents/secrets/{delete_name}", method="DELETE")
+        click.echo(f"✓ Agent secret {delete_name} deleted")
+        return
+    if secret_name:
+        if value is None:
+            click.echo("--value required with --set", err=True)
+            sys.exit(1)
+        key = _request(f"/repos/{repo}/agents/secrets/public-key")
+        encrypted = _encrypt_secret(key.get("key", ""), value)
+        _request(f"/repos/{repo}/agents/secrets/{secret_name}", method="PUT",
+                 json={"encrypted_value": encrypted, "key_id": key.get("key_id", "")})
+        click.echo(f"✓ Agent secret {secret_name} set")
+        return
+    data = _request(f"/repos/{repo}/agents/secrets")
+    names = [s.get("name") for s in data.get("secrets", [])]
+    click.echo(", ".join(names) if names else "(no agent secrets)")
+
+
+@cli.command(name="agent-variable")
+@click.argument("repo")
+@click.option("--set", "var_name", default=None, help="Variable name to set")
+@click.option("--value", default=None, help="Variable value (for --set)")
+@click.option("--delete", "delete_name", default=None, help="Variable name to delete")
+def agent_variable(repo, var_name, value, delete_name):
+    """Manage GitHub Agents variables: list (default), --set, --delete."""
+    if delete_name:
+        _request(f"/repos/{repo}/agents/variables/{delete_name}", method="DELETE")
+        click.echo(f"✓ Agent variable {delete_name} deleted")
+        return
+    if var_name:
+        if value is None:
+            click.echo("--value required with --set", err=True)
+            sys.exit(1)
+        resp = requests.get(f"{BASE_URL}/repos/{repo}/agents/variables/{var_name}",
+                            headers=_headers(), timeout=30)
+        if resp.status_code == 404:
+            _request(f"/repos/{repo}/agents/variables", method="POST",
+                     json={"name": var_name, "value": value})
+            click.echo(f"✓ Agent variable {var_name} set (created)")
+        elif resp.status_code >= 400:
+            _fail_status(resp, f"/repos/{repo}/agents/variables/{var_name}")
+        else:
+            _request(f"/repos/{repo}/agents/variables/{var_name}", method="PATCH",
+                     json={"value": value})
+            click.echo(f"✓ Agent variable {var_name} set (updated)")
+        return
+    data = _request(f"/repos/{repo}/agents/variables")
+    vars_ = data.get("variables", [])
+    if not vars_:
+        click.echo("(no agent variables)")
+        return
+    for v in vars_:
+        click.echo(f"{v.get('name', '?')} = {v.get('value', '')}")
+
+
+# ===========================================================================
+# GraphQL: escape hatch, Projects v2, Discussions
+# ===========================================================================
+@cli.command()
+@click.argument("query")
+@click.option("--var", "vars", multiple=True, help="Variable as JSON k=v (repeatable)")
+def graphql(query, vars):
+    """Run an arbitrary GraphQL query (escape hatch for Projects v2, Discussions, etc.)."""
+    variables = None
+    if vars:
+        variables = {}
+        for v in vars:
+            if "=" in v:
+                k, _, val = v.partition("=")
+                variables[k] = val
+    data = _gql(query, variables)
+    click.echo(json_dumps(data))
+
+
+def _resolve_project_owner(owner, org, repo_name):
+    """Return (ownerId, projectV2Id, number) for the target scope."""
+    if repo_name:
+        d = _gql(
+            "query($o:String!,$r:String!){repository(owner:$o,name:$r){id projectsV2(first:20){nodes{id title number}}}}",
+            {"o": repo_name.split("/")[0], "r": repo_name.split("/")[1]},
+        )
+        return d.get("repository", {}), None
+    if org:
+        d = _gql(
+            "query($o:String!){organization(login:$o){id projectsV2(first:20){nodes{id title number}}}}",
+            {"o": org},
+        )
+        return d.get("organization", {}), None
+    d = _gql(
+        "query{viewer{id projectsV2(first:20){nodes{id title number}}}}"
+    )
+    return d.get("viewer", {}), None
+
+
+def _find_project(number, org_name, repo_name):
+    """Find a Projects v2 board by number. With --repo, falls back to the
+    repo owner's own projects (createProjectV2 makes owner-scoped boards)."""
+    if repo_name:
+        scope, _ = _resolve_project_owner(None, None, repo_name)
+        projects = (scope.get("projectsV2") or {}).get("nodes", [])
+        proj = next((p for p in projects if p.get("number") == number), None)
+        if proj:
+            return proj
+        owner_login = repo_name.split("/")[0]
+        try:
+            d = _gql(
+                "query($o:String!){user(login:$o){projectsV2(first:50){nodes{id number title}}}}",
+                {"o": owner_login},
+            )
+            projects = (d.get("user") or {}).get("projectsV2", {}).get("nodes", [])
+            return next((p for p in projects if p.get("number") == number), None)
+        except SystemExit:
+            return None
+    scope, _ = _resolve_project_owner(None, org_name, None)
+    projects = (scope.get("projectsV2") or {}).get("nodes", [])
+    return next((p for p in projects if p.get("number") == number), None)
+
+
+@cli.command(name="project-list")
+@click.option("--owner", default=None, help="List your projects (default), or use --org/--repo")
+@click.option("--org", "org_name", default=None, help="Org name")
+@click.option("--repo", "repo_name", default=None, help="Repo (o/r)")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def project_list(owner, org_name, repo_name, max_items):
+    """List Projects v2 (user, org, or repo level)."""
+    _ = owner
+    scope, _ = _resolve_project_owner(None, org_name, repo_name)
+    projects = (scope.get("projectsV2") or {}).get("nodes", [])[:max_items]
+    if not projects:
+        click.echo("(none)")
+        return
+    for p in projects:
+        click.echo(f"{p.get('number', '?')} | {p.get('title', '?')} | {p.get('id', '?')}")
+
+
+@cli.command(name="project-view")
+@click.argument("project_number", type=int)
+@click.option("--owner", default=None, help="Your project (default)")
+@click.option("--org", "org_name", default=None, help="Org name")
+@click.option("--repo", "repo_name", default=None, help="Repo (o/r)")
+def project_view(project_number, owner, org_name, repo_name):
+    """Show a Projects v2 board: title, fields, and items."""
+    _ = owner
+    proj = _find_project(project_number, org_name, repo_name)
+    if not proj:
+        click.echo(f"Project #{project_number} not found", err=True)
+        sys.exit(5)
+    pid = proj["id"]
+    click.echo(f"Project #{project_number}: {proj.get('title', '?')}")
+    d = _gql(
+        """query($id:ID!){ node(id:$id){
+          ... on ProjectV2 {
+            fields(first:50){nodes{... on ProjectV2SingleSelectField{id name options{id name}}
+                                 ... on ProjectV2IterationField{id name configuration{duration}}
+                                 ... on ProjectV2FieldCommon{id name}}}
+            items(first:50){nodes{id type
+              fieldValues(first:30){nodes{
+                ... on ProjectV2ItemFieldSingleSelectValue{name field{... on ProjectV2SingleSelectField{name}}}
+                ... on ProjectV2ItemFieldTextValue{text field{... on ProjectV2FieldCommon{name}}}
+                ... on ProjectV2ItemFieldDateValue{date field{... on ProjectV2FieldCommon{name}}}
+              }}
+              content{... on Issue{number title state}
+                      ... on PullRequest{number title state}
+                      ... on DraftIssue{title}}}
+            }
+          }}}""",
+        {"id": pid},
+    )
+    node = d.get("node", {})
+    fields = node.get("fields", {}).get("nodes", [])
+    for f in fields:
+        if "options" in f:
+            opts = ", ".join(o.get("name", "?") for o in f["options"])
+            click.echo(f"field: {f.get('name', '?')} [{opts}]")
+        else:
+            click.echo(f"field: {f.get('name', '?')}")
+    items = node.get("items", {}).get("nodes", [])
+    if not items:
+        click.echo("(no items)")
+        return
+    for it in items:
+        content = it.get("content") or {}
+        itype = (it.get("type") or "").upper()
+        if itype == "ISSUE":
+            label = f"#{content.get('number', '?')} {content.get('title', '?')} ({content.get('state', '?')})"
+        elif itype == "PULL_REQUEST":
+            label = f"PR#{content.get('number', '?')} {content.get('title', '?')} ({content.get('state', '?')})"
+        else:
+            label = f"draft: {content.get('title', '?')}"
+        vals = []
+        for fv in it.get("fieldValues", {}).get("nodes", []):
+            if fv.get("name"):
+                vals.append(f"{fv.get('field', {}).get('name', '?')}={fv['name']}")
+            elif fv.get("text"):
+                vals.append(f"{fv.get('field', {}).get('name', '?')}={fv['text']}")
+            elif fv.get("date"):
+                vals.append(f"{fv.get('field', {}).get('name', '?')}={fv['date']}")
+        extra = " | " + ", ".join(vals) if vals else ""
+        click.echo(f"item {it.get('id', '?')} | {it.get('type', '?')} | {label}{extra}")
+
+
+@cli.command(name="project-create")
+@click.argument("title")
+@click.option("--owner", default=None, help="Create on your account (default)")
+@click.option("--org", "org_name", default=None, help="Org name")
+@click.option("--repo", "repo_name", default=None, help="Repo (o/r)")
+def project_create(title, owner, org_name, repo_name):
+    """Create a Projects v2 board."""
+    _ = owner
+    scope, _ = _resolve_project_owner(None, org_name, repo_name)
+    owner_id = scope.get("id")
+    if not owner_id:
+        click.echo("Cannot resolve owner id", err=True)
+        sys.exit(1)
+    # Repo scope: projects are owned by the repo's OWNER (user/org), not the repo node
+    if repo_name and not org_name:
+        d = _gql(
+            "query($o:String!,$r:String!){repository(owner:$o,name:$r){owner{id}}}",
+            {"o": repo_name.split("/")[0], "r": repo_name.split("/")[1]},
+        )
+        owner_id = d.get("repository", {}).get("owner", {}).get("id")
+        if not owner_id:
+            click.echo("Cannot resolve repo owner id", err=True)
+            sys.exit(1)
+    d = _gql(
+        "mutation($oid:ID!,$t:String!){createProjectV2(input:{ownerId:$oid,title:$t}){projectV2{id number title}}}",
+        {"oid": owner_id, "t": title},
+    )
+    p = d.get("createProjectV2", {}).get("projectV2", {})
+    hint = " (owner-scoped; view via project-view --repo N thanks to scope fallback)" if repo_name and not org_name else ""
+    click.echo(f"✓ Project #{p.get('number', '?')} created: {p.get('title', '?')}{hint}")
+
+
+@cli.command(name="project-fields")
+@click.argument("project_number", type=int)
+@click.option("--owner", default=None)
+@click.option("--org", "org_name", default=None)
+@click.option("--repo", "repo_name", default=None)
+def project_fields(project_number, owner, org_name, repo_name):
+    """Show Projects v2 fields and options (for --set-field)."""
+    _ = owner
+    proj = _find_project(project_number, org_name, repo_name)
+    if not proj:
+        click.echo(f"Project #{project_number} not found", err=True)
+        sys.exit(5)
+    d = _gql(
+        """query($id:ID!){ node(id:$id){ ... on ProjectV2 { fields(first:50){nodes{
+          ... on ProjectV2SingleSelectField{id name options{id name}}
+          ... on ProjectV2FieldCommon{id name} }} }} }""",
+        {"id": proj["id"]},
+    )
+    for f in (d.get("node") or {}).get("fields", {}).get("nodes", []):
+        if "options" in f:
+            opts = ", ".join(f"{o.get('name')}({o.get('id')})" for o in f["options"])
+            click.echo(f"{f.get('name', '?')} [{opts}]")
+        else:
+            click.echo(f"{f.get('name', '?')} (id {f.get('id', '?')})")
+
+
+@cli.command(name="project-delete")
+@click.argument("project_number", type=int)
+@click.option("--owner", default=None)
+@click.option("--org", "org_name", default=None)
+@click.option("--repo", "repo_name", default=None)
+@click.option("--yes", is_flag=True, default=False, help="Confirm deletion (required)")
+def project_delete(project_number, owner, org_name, repo_name, yes):
+    """Delete a Projects v2 board (requires --yes)."""
+    if not yes:
+        click.echo("Add --yes to confirm project deletion.", err=True)
+        sys.exit(1)
+    _ = owner
+    proj = _find_project(project_number, org_name, repo_name)
+    if not proj:
+        click.echo(f"Project #{project_number} not found", err=True)
+        sys.exit(5)
+    _gql("mutation($id:ID!){deleteProjectV2(input:{projectId:$id}){projectV2{id}}}",
+         {"id": proj["id"]})
+    click.echo(f"✓ Project #{project_number} deleted")
+
+
+@cli.command(name="project-add-item")
+@click.argument("project_number", type=int)
+@click.option("--repo", "repo_name", required=True, help="Repo (o/r)")
+@click.option("--issue", type=int, default=None, help="Issue number to add")
+@click.option("--pr", type=int, default=None, help="PR number to add")
+@click.option("--content-id", default=None, help="Raw GraphQL content ID (alternative to --issue/--pr)")
+def project_add_item(project_number, repo_name, issue, pr, content_id):
+    """Add an issue/PR to a Projects v2 board."""
+    proj = _find_project(project_number, None, repo_name)
+    if not proj:
+        click.echo(f"Project #{project_number} not found for repo {repo_name}", err=True)
+        sys.exit(5)
+    if not content_id:
+        if issue is not None:
+            d = _gql(
+                "query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){issue(number:$n){id}}}",
+                {"o": repo_name.split("/")[0], "r": repo_name.split("/")[1], "n": issue},
+            )
+            content_id = d.get("repository", {}).get("issue", {}).get("id")
+        elif pr is not None:
+            d = _gql(
+                "query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){id}}}",
+                {"o": repo_name.split("/")[0], "r": repo_name.split("/")[1], "n": pr},
+            )
+            content_id = d.get("repository", {}).get("pullRequest", {}).get("id")
+    if not content_id:
+        click.echo("Cannot resolve content id (need --issue, --pr, or --content-id)", err=True)
+        sys.exit(1)
+    d = _gql(
+        "mutation($pid:ID!,$cid:ID!){addProjectV2ItemById(input:{projectId:$pid,contentId:$cid}){item{id}}}",
+        {"pid": proj["id"], "cid": content_id},
+    )
+    item = d.get("addProjectV2ItemById", {}).get("item", {})
+    click.echo(f"✓ Item added: {item.get('id', '?')}")
+
+
+@cli.command(name="project-set-field")
+@click.argument("project_number", type=int)
+@click.option("--item-id", required=True, help="Item ID from project-view")
+@click.option("--field", "field_name", required=True, help="Field name")
+@click.option("--value", "field_value", required=True, help="Single-select option name (or text/number value)")
+@click.option("--owner", default=None)
+@click.option("--org", "org_name", default=None)
+@click.option("--repo", "repo_name", default=None)
+def project_set_field(project_number, item_id, field_name, field_value, owner, org_name, repo_name):
+    """Set a single-select field value on a project item."""
+    _ = owner
+    proj = _find_project(project_number, org_name, repo_name)
+    if not proj:
+        click.echo(f"Project #{project_number} not found", err=True)
+        sys.exit(5)
+    d = _gql(
+        """query($id:ID!){ node(id:$id){ ... on ProjectV2 { fields(first:50){nodes{
+          ... on ProjectV2SingleSelectField{id name options{id name}} }} }} }""",
+        {"id": proj["id"]},
+    )
+    field = next((f for f in (d.get("node") or {}).get("fields", {}).get("nodes", [])
+                  if f.get("name") == field_name), None)
+    if not field:
+        click.echo(f"Field not found: {field_name}", err=True)
+        sys.exit(1)
+    option = next((o for o in field.get("options", []) if o.get("name") == field_value), None)
+    if not option:
+        click.echo(f"Option not found: {field_value}", err=True)
+        sys.exit(1)
+    _gql(
+        """mutation($pid:ID!,$iid:ID!,$fid:ID!,$oid:String!){
+          updateProjectV2ItemFieldValue(input:{projectId:$pid,itemId:$iid,fieldId:$fid,
+            value:{singleSelectOptionId:$oid}}){projectV2Item{id}}}""",
+        {"pid": proj["id"], "iid": item_id, "fid": field["id"], "oid": option["id"]},
+    )
+    click.echo(f"✓ {field_name} = {field_value}")
+
+
+@cli.command(name="discussion-list")
+@click.argument("repo")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def discussion_list(repo, max_items):
+    """List Discussions (requires Discussions enabled on the repo)."""
+    d = _gql(
+        """query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){
+          discussions(first:$n){nodes{id number title answerChosenAt upvoteCount
+            category{name} comments{totalCount}}}}}""",
+        {"o": repo.split("/")[0], "r": repo.split("/")[1], "n": min(max_items, 50)},
+    )
+    items = (d.get("repository") or {}).get("discussions", {}).get("nodes", [])
+    if not items:
+        click.echo("(none or Discussions not enabled)")
+        return
+    for x in items:
+        answered = " [answered]" if x.get("answerChosenAt") else ""
+        click.echo(f"#{x.get('number', '?')}{answered} {x.get('title', '?')} | {x.get('category', {}).get('name', '?')} | {x.get('upvoteCount', 0)}↑ | {x.get('comments', {}).get('totalCount', 0)} comments")
+
+
+@cli.command(name="discussion-view")
+@click.argument("repo")
+@click.argument("number", type=int)
+def discussion_view(repo, number):
+    """View a Discussion with its comments."""
+    d = _gql(
+        """query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){
+          discussion(number:$n){id number title body
+            category{name} upvoteCount
+            comments(first:50){nodes{id author{login} body createdAt}}}}}""",
+        {"o": repo.split("/")[0], "r": repo.split("/")[1], "n": number},
+    )
+    disc = (d.get("repository") or {}).get("discussion")
+    if not disc:
+        click.echo(f"Discussion #{number} not found", err=True)
+        sys.exit(5)
+    click.echo(f"#{disc.get('number', '?')} | {disc.get('title', '?')} | {disc.get('category', {}).get('name', '?')} | {disc.get('upvoteCount', 0)}↑")
+    click.echo(f"--- body ---")
+    body = disc.get("body", "")
+    for i, line in enumerate(body.splitlines()[:100], 1):
+        click.echo(f"{i}: {line}")
+    comments = disc.get("comments", {}).get("nodes", [])
+    if comments:
+        click.echo(f"--- {len(comments)} comments ---")
+        for c in comments:
+            click.echo(f"{c.get('author', {}).get('login', '?')} | {_d(c.get('createdAt'))} | {(c.get('body') or '').replace(chr(10), ' ')[:120]}")
+
+
+@cli.command(name="discussion-create")
+@click.argument("repo")
+@click.option("--title", required=True, help="Discussion title")
+@click.option("--category", required=True, help="Category name (see discussion-categories)")
+@click.option("--body", default=None, help="Discussion body")
+@click.option("--body-file", default=None, help="Read body from file")
+def discussion_create(repo, title, category, body, body_file):
+    """Create a Discussion (requires Discussions enabled)."""
+    _check_token()
+    resolved = _require_body(body, body_file)
+    d = _gql(
+        """query($o:String!,$r:String!){repository(owner:$o,name:$r){id discussionCategories(first:30){nodes{id name}}}}""",
+        {"o": repo.split("/")[0], "r": repo.split("/")[1]},
+    )
+    repo_node = d.get("repository") or {}
+    cat = next((c for c in repo_node.get("discussionCategories", {}).get("nodes", [])
+                if c.get("name") == category), None)
+    if not cat:
+        click.echo(f"Category not found: {category}", err=True)
+        sys.exit(1)
+    d2 = _gql(
+        """mutation($rid:ID!,$t:String!,$b:String!,$cid:ID!){
+          createDiscussion(input:{repositoryId:$rid,title:$t,body:$b,categoryId:$cid}){discussion{number title}}}""",
+        {"rid": repo_node.get("id"), "t": title, "b": resolved, "cid": cat.get("id")},
+    )
+    disc = d2.get("createDiscussion", {}).get("discussion", {})
+    click.echo(f"✓ Discussion #{disc.get('number', '?')} created: {disc.get('title', '?')}")
+
+
+@cli.command(name="discussion-categories")
+@click.argument("repo")
+def discussion_categories(repo):
+    """List Discussion categories."""
+    d = _gql(
+        """query($o:String!,$r:String!){repository(owner:$o,name:$r){
+          discussionCategories(first:30){nodes{id name description}}}}""",
+        {"o": repo.split("/")[0], "r": repo.split("/")[1]},
+    )
+    cats = (d.get("repository") or {}).get("discussionCategories", {}).get("nodes", [])
+    if not cats:
+        click.echo("(none or Discussions not enabled)")
+        return
+    for c in cats:
+        click.echo(f"{c.get('name', '?')} | {c.get('description') or ''}")
+
+
+@cli.command(name="discussion-comment")
+@click.argument("repo")
+@click.argument("number", type=int)
+@click.option("--body", default=None, help="Comment text")
+@click.option("--body-file", default=None, help="Read comment from file")
+def discussion_comment(repo, number, body, body_file):
+    """Comment on a Discussion."""
+    _check_token()
+    resolved = _require_body(body, body_file)
+    d = _gql(
+        """query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){discussion(number:$n){id}}}""",
+        {"o": repo.split("/")[0], "r": repo.split("/")[1], "n": number},
+    )
+    disc = (d.get("repository") or {}).get("discussion")
+    if not disc:
+        click.echo(f"Discussion #{number} not found", err=True)
+        sys.exit(5)
+    d2 = _gql(
+        "mutation($did:ID!,$b:String!){addDiscussionComment(input:{discussionId:$did,body:$b}){comment{id}}}",
+        {"did": disc.get("id"), "b": resolved},
+    )
+    click.echo(f"✓ Comment added (id {d2.get('addDiscussionComment', {}).get('comment', {}).get('id', '?')})")
 
 
 # ===========================================================================
