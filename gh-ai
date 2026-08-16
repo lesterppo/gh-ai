@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
-"""gh-ai — AI-native GitHub CLI. Token-optimized output for LLM consumption."""
+"""gh-ai — AI-native GitHub CLI. Token-optimized output for LLM consumption.
 
+Covers the full GitHub REST API surface with compact, agent-friendly output:
+no URLs, node IDs, avatars, or nested metadata. Lists are one line per item,
+views are compact YAML, writes return short confirmations.
+
+Exit codes: 1 input error | 2 network | 3 401 | 4 403 | 5 404 | 6 other HTTP
+            7 git failed | 8 git timeout | 9 git not found
+"""
+
+import base64
 import io
+import mimetypes
 import os
 import re
 import sys
@@ -16,7 +26,13 @@ import click
 import requests
 import yaml
 
-VERSION = "1.1.0"
+try:
+    import nacl.public  # only needed for action-secret set
+    _HAVE_NACL = True
+except Exception:  # pragma: no cover
+    _HAVE_NACL = False
+
+VERSION = "2.0.0"
 
 # ---------------------------------------------------------------------------
 # Config
@@ -27,6 +43,7 @@ GITHUB_TOKEN = (
     or os.getenv("GH_TOKEN")
 )
 BASE_URL = "https://api.github.com"
+UPLOADS_URL = "https://uploads.github.com"
 
 IGNORE_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp",
@@ -40,6 +57,8 @@ IGNORE_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".tox"}
 
 MAX_FILE_LINES = 500
 MAX_LOG_LINES = 500
+DEFAULT_LIST = 20
+SEARCH_TOP = 5
 
 
 # ---------------------------------------------------------------------------
@@ -59,30 +78,8 @@ def _headers(accept="application/vnd.github.v3+json"):
     }
 
 
-def _request(path, raw=False, method="GET", json=None, timeout=30, retry=True):
-    _check_token()
-    url = f"{BASE_URL}{path}"
-    hdrs = _headers("application/vnd.github.v3.raw" if raw else "application/vnd.github.v3+json")
-    try:
-        if method == "GET":
-            resp = requests.get(url, headers=hdrs, timeout=timeout, allow_redirects=not raw)
-        elif method == "POST":
-            resp = requests.post(url, headers=hdrs, json=json, timeout=timeout)
-        elif method == "PUT":
-            resp = requests.put(url, headers=hdrs, json=json, timeout=timeout)
-        elif method == "PATCH":
-            resp = requests.patch(url, headers=hdrs, json=json, timeout=timeout)
-        elif method == "DELETE":
-            resp = requests.delete(url, headers=hdrs, timeout=timeout)
-        else:
-            resp = requests.request(method, url, headers=hdrs, json=json, timeout=timeout)
-    except requests.RequestException as e:
-        if retry and method == "GET":
-            time.sleep(1)
-            return _request(path, raw=raw, method=method, json=json, timeout=timeout, retry=False)
-        click.echo(f"Request failed: {e}", err=True)
-        sys.exit(2)
-
+def _fail_status(resp, path):
+    """Map a response status code to the canonical gh-ai exit code."""
     if resp.status_code == 401:
         click.echo("Bad credentials. Check GITHUB_TOKEN", err=True)
         sys.exit(3)
@@ -96,22 +93,142 @@ def _request(path, raw=False, method="GET", json=None, timeout=30, retry=True):
     elif resp.status_code == 404:
         click.echo(f"Not found: {path}", err=True)
         sys.exit(5)
+    elif resp.status_code == 422:
+        click.echo(f"Unprocessable (422): {resp.text[:300]}", err=True)
+        sys.exit(6)
     elif resp.status_code >= 400:
         click.echo(f"HTTP {resp.status_code}: {resp.text[:300]}", err=True)
         sys.exit(6)
 
+
+def _request(path, raw=False, method="GET", json=None, timeout=30, retry=True, accept=None):
+    _check_token()
+    url = f"{BASE_URL}{path}"
+    hdrs = _headers(accept or ("application/vnd.github.v3.raw" if raw else "application/vnd.github.v3+json"))
+    try:
+        if method == "GET":
+            resp = requests.get(url, headers=hdrs, timeout=timeout, allow_redirects=not raw)
+        elif method == "POST":
+            resp = requests.post(url, headers=hdrs, json=json, timeout=timeout)
+        elif method == "PUT":
+            resp = requests.put(url, headers=hdrs, json=json, timeout=timeout)
+        elif method == "PATCH":
+            resp = requests.patch(url, headers=hdrs, json=json, timeout=timeout)
+        elif method == "DELETE":
+            resp = requests.delete(url, headers=hdrs, json=json, timeout=timeout)
+        else:
+            resp = requests.request(method, url, headers=hdrs, json=json, timeout=timeout)
+    except requests.RequestException as e:
+        if retry and method == "GET":
+            time.sleep(1)
+            return _request(path, raw=raw, method=method, json=json, timeout=timeout, retry=False, accept=accept)
+        click.echo(f"Request failed: {e}", err=True)
+        sys.exit(2)
+
+    if resp.status_code == 204:
+        return None
+    if resp.status_code >= 400:
+        _fail_status(resp, path)
+
     if raw:
         return resp.text
-    return resp.json()
+    try:
+        return resp.json()
+    except ValueError:
+        return None
+
+
+def _get_list(path, max_items=DEFAULT_LIST, extract_keys=None, **params):
+    """GET a list endpoint with pagination. Handles plain arrays and
+    {total_count, <key>: [...]} envelopes. Returns list capped at max_items."""
+    per = min(max(1, int(max_items)), 100)
+    params["per_page"] = per
+    url = f"{BASE_URL}{path}"
+    out = []
+    page = 0
+    while url and len(out) < max_items:
+        page += 1
+        if page > 10:
+            break
+        resp = requests.get(url, headers=_headers(), params=params, timeout=30)
+        if resp.status_code >= 400:
+            _fail_status(resp, path)
+        data = resp.json()
+        if isinstance(data, list):
+            out.extend(data)
+        elif isinstance(data, dict):
+            found = False
+            for key in extract_keys or ("items", "workflow_runs", "check_runs", "jobs",
+                                        "actions_caches", "secrets", "variables", "workflows",
+                                        "statuses", "events", "comments", "files", "reviews",
+                                        "results"):
+                if isinstance(data.get(key), list):
+                    out.extend(data[key])
+                    found = True
+                    break
+            if not found:
+                break
+        link = resp.headers.get("Link", "")
+        m = re.search(r'<([^>]+)>;\s*rel="next"', link)
+        url = m.group(1) if m else None
+        params = {}
+    return out[:max_items]
+
+
+def _upload_file(path, file_path, name=None, timeout=120):
+    """Upload a release asset to uploads.github.com. Returns parsed JSON."""
+    _check_token()
+    if not os.path.isfile(file_path):
+        click.echo(f"File not found: {file_path}", err=True)
+        sys.exit(1)
+    fname = name or os.path.basename(file_path)
+    ctype = mimetypes.guess_type(fname)[0] or "application/octet-stream"
+    url = f"{UPLOADS_URL}{path}?name={urllib.parse.quote(fname)}"
+    hdrs = _headers()
+    hdrs["Accept"] = "application/vnd.github.v3+json"
+    hdrs["Content-Type"] = ctype  # GitHub rejects uploads without an explicit valid media type
+    try:
+        with open(file_path, "rb") as f:
+            resp = requests.post(url, headers=hdrs, data=f, timeout=timeout)
+    except requests.RequestException as e:
+        click.echo(f"Upload failed: {e}", err=True)
+        sys.exit(2)
+    if resp.status_code >= 400:
+        _fail_status(resp, path)
+    try:
+        return resp.json()
+    except ValueError:
+        return None
+
+
+def _encrypt_secret(public_key, value):
+    """Encrypt an Actions secret with libsodium SealedBox."""
+    if not _HAVE_NACL:
+        click.echo("pynacl is required for action-secret set: pip install pynacl", err=True)
+        sys.exit(1)
+    key = nacl.public.PublicKey(base64.b64decode(public_key))
+    box = nacl.public.SealedBox(key)
+    return base64.b64encode(box.encrypt(value.encode("utf-8"))).decode("ascii")
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Shared helpers
 # ---------------------------------------------------------------------------
 def _login(user):
     if user is None:
         return "ghost"
     return user.get("login", "unknown")
+
+
+def _d(iso):
+    """YYYY-MM-DD (or '' if missing)."""
+    if not iso:
+        return ""
+    return str(iso)[:10]
+
+
+def _sha7(sha):
+    return (sha or "")[:7]
 
 
 def _resolve_body(body, body_file):
@@ -139,6 +256,20 @@ def _require_body(body, body_file):
     return text.strip()
 
 
+def _fmt_labels(labels):
+    return ", ".join(lbl.get("name", "") for lbl in (labels or []) if lbl)
+
+
+def _fmt_repo_line(r):
+    stars = r.get("stargazers_count", 0)
+    lang = r.get("language") or "?"
+    desc = (r.get("description") or "").strip()
+    line = f"{r['full_name']} ★{stars} | {lang}"
+    if desc:
+        line += f" | {desc[:120]}"
+    return line
+
+
 # ---------------------------------------------------------------------------
 # Formatters
 # ---------------------------------------------------------------------------
@@ -155,7 +286,7 @@ def _count_reactions(issue_data):
 
 
 def _format_issue(issue, comments):
-    labels = [lbl.get("name", "") for lbl in issue.get("labels", []) if lbl]
+    labels = _fmt_labels(issue.get("labels"))
     rxns = _count_reactions(issue)
     out = {
         "title": issue.get("title", ""),
@@ -164,7 +295,7 @@ def _format_issue(issue, comments):
         "body": issue.get("body", ""),
     }
     if labels:
-        out["labels"] = ", ".join(labels)
+        out["labels"] = labels
     if issue.get("state_reason"):
         out["state_reason"] = issue["state_reason"]
     if rxns:
@@ -223,9 +354,9 @@ def _format_log_errors(log_text):
     return "\n".join(out)
 
 
-def _format_search_repos(results):
+def _format_search_repos(results, max_items=SEARCH_TOP):
     out = []
-    items = results.get("items", [])[:5]
+    items = results.get("items", [])[:max_items]
     if not items:
         return "(no results)"
     for i, item in enumerate(items, 1):
@@ -238,9 +369,9 @@ def _format_search_repos(results):
     return "\n".join(out)
 
 
-def _format_search_issues(results):
+def _format_search_issues(results, max_items=SEARCH_TOP):
     out = []
-    items = results.get("items", [])[:5]
+    items = results.get("items", [])[:max_items]
     if not items:
         return "(no results)"
     for i, item in enumerate(items, 1):
@@ -253,8 +384,62 @@ def _format_search_issues(results):
     return "\n".join(out)
 
 
+def _format_search_code(results, max_items=SEARCH_TOP):
+    out = []
+    items = results.get("items", [])[:max_items]
+    if not items:
+        return "(no results)"
+    for i, item in enumerate(items, 1):
+        repo = item.get("repository", {}).get("full_name", "?")
+        path = item.get("path", "")
+        out.append(f"{i}. {repo} | {path}")
+    return "\n".join(out)
+
+
+def _format_search_users(results, max_items=SEARCH_TOP):
+    out = []
+    items = results.get("items", [])[:max_items]
+    if not items:
+        return "(no results)"
+    for i, item in enumerate(items, 1):
+        name = item.get("name") or ""
+        flw = item.get("followers", 0)
+        repos = item.get("public_repos", 0)
+        out.append(f"{i}. {item['login']} | {name} | followers:{flw} | repos:{repos}")
+    return "\n".join(out)
+
+
+def _format_search_commits(results, max_items=SEARCH_TOP):
+    out = []
+    items = results.get("items", [])[:max_items]
+    if not items:
+        return "(no results)"
+    for i, item in enumerate(items, 1):
+        repo = item.get("repository", {}).get("full_name", "?")
+        sha = _sha7(item.get("sha"))
+        author = item.get("commit", {}).get("author", {}).get("name", "?")
+        date = _d(item.get("commit", {}).get("author", {}).get("date"))
+        msg = (item.get("commit", {}).get("message") or "").splitlines()[0]
+        out.append(f"{i}. {repo} {sha} | {author} | {date} | {msg[:100]}")
+    return "\n".join(out)
+
+
+def _format_search_topics(results, max_items=SEARCH_TOP):
+    out = []
+    items = results.get("items", [])[:max_items]
+    if not items:
+        return "(no results)"
+    for i, item in enumerate(items, 1):
+        curated = "curated" if item.get("curated") else ""
+        desc = (item.get("short_description") or "").strip()
+        out.append(f"{i}. {item['name']} {curated}".rstrip())
+        if desc:
+            out.append(f"   {desc[:120]}")
+    return "\n".join(out)
+
+
 def _format_pr(pr, reviews):
-    labels = [lbl.get("name", "") for lbl in pr.get("labels", []) if lbl]
+    labels = _fmt_labels(pr.get("labels"))
     head = pr.get("head", {})
     base = pr.get("base", {})
     out = {
@@ -267,7 +452,7 @@ def _format_pr(pr, reviews):
         "draft": pr.get("draft", False),
     }
     if labels:
-        out["labels"] = ", ".join(labels)
+        out["labels"] = labels
     if pr.get("additions") is not None:
         out["diff"] = f"+{pr['additions']} -{pr['deletions']} ({pr.get('changed_files', 0)} files)"
     if pr.get("state_reason"):
@@ -444,18 +629,366 @@ def cli():
     pass
 
 
-# ---- rate-limit ----------------------------------------------------------
+# ===========================================================================
+# Info / utils
+# ===========================================================================
 @cli.command()
 def rate_limit():
     """Show current GitHub API rate limit status."""
     data = _request("/rate_limit")
-    core = data.get("resources", {}).get("core", {})
-    search = data.get("resources", {}).get("search", {})
-    click.echo(f"core:   {core.get('remaining', '?')}/{core.get('limit', '?')} remaining, resets {time.strftime('%H:%M:%S', time.localtime(core.get('reset', 0)))}")
-    click.echo(f"search: {search.get('remaining', '?')}/{search.get('limit', '?')} remaining, resets {time.strftime('%H:%M:%S', time.localtime(search.get('reset', 0)))}")
+    resources = data.get("resources", {})
+    for name in ("core", "search", "graphql", "actions", "code_scanning_upload"):
+        res = resources.get(name)
+        if not res:
+            continue
+        remaining = res.get("remaining", "?")
+        limit = res.get("limit", "?")
+        reset = time.strftime("%H:%M:%S", time.localtime(res.get("reset", 0)))
+        click.echo(f"{name}: {remaining}/{limit} remaining, resets {reset}")
 
 
-# ---- repo-tree ----------------------------------------------------------
+@cli.command(name="auth-status")
+def auth_status():
+    """Show authenticated user and token scopes."""
+    _check_token()
+    resp = requests.get(f"{BASE_URL}/user", headers=_headers(), timeout=30)
+    if resp.status_code >= 400:
+        _fail_status(resp, "/user")
+    user = resp.json()
+    scopes = resp.headers.get("X-OAuth-Scopes", "").strip() or "(no scopes)"
+    click.echo(f"login: {user.get('login', '?')}")
+    click.echo(f"name: {user.get('name') or ''}")
+    click.echo(f"scopes: {scopes}")
+    click.echo(f"rate: {resp.headers.get('X-RateLimit-Remaining', '?')}/{resp.headers.get('X-RateLimit-Limit', '?')}")
+
+
+@cli.command()
+@click.argument("path")
+@click.option("--method", default="GET", help="HTTP method (GET/POST/PATCH/PUT/DELETE)")
+@click.option("--data", default=None, help="JSON body string")
+@click.option("--data-file", default=None, help="Read JSON body from file")
+@click.option("--raw", is_flag=True, default=False, help="Print raw body (e.g. for diff/text endpoints)")
+def api(path, method, data, data_file, raw):
+    """Raw GitHub REST API passthrough. Escape hatch for any endpoint.
+
+    Path may omit the leading slash: gh-ai api repos/o/r. Accept headers:
+    add the header suffix in parens, e.g. 'repos/o/r/pulls/1 --raw' uses
+    the .diff media type automatically when --raw is set.
+    """
+    _check_token()
+    if not path.startswith("/"):
+        path = "/" + path
+    body = None
+    if data:
+        try:
+            body = json_parse(data)
+        except Exception:
+            body = data
+    elif data_file:
+        try:
+            with open(data_file, "r") as f:
+                body = json_parse(f.read())
+        except OSError as e:
+            click.echo(f"Cannot read data file: {e}", err=True)
+            sys.exit(1)
+
+    accept = None
+    if raw:
+        accept = "application/vnd.github.v3.raw"
+    result = _request(path, raw=raw, method=method.upper(), json=body, accept=accept)
+    if raw:
+        click.echo(result if isinstance(result, str) else "(empty)")
+    else:
+        if result is None:
+            click.echo("(ok)")
+        elif isinstance(result, (dict, list)):
+            click.echo(json_dumps(result))
+        else:
+            click.echo(str(result))
+
+
+@cli.command()
+def meta():
+    """Show GitHub API metadata / supported features."""
+    data = _request("/meta")
+    click.echo(f"verifiable_password_authentication: {data.get('verifiable_password_authentication', '?')}")
+    features = data.get("api", {}).get("sso", [])
+    click.echo(f"installed_version: {data.get('installed_version', '?')}")
+    click.echo("github_enterprise_importer: " + str(data.get("github_enterprise_importer", "?")))
+    ssh = data.get("ssh_key_fingerprints", {})
+    if ssh:
+        click.echo("ssh fingerprints: " + ", ".join(f"{k}={v[:16]}" for k, v in ssh.items()))
+
+
+@cli.command(name="license-list")
+def license_list():
+    """List available license templates."""
+    items = _get_list("/licenses", max_items=100, extract_keys=("licenses",))
+    if not items:
+        click.echo("(none)")
+        return
+    for lic in items:
+        click.echo(f"{lic.get('key', '?')} | {lic.get('name', '?')} | {lic.get('spdx_id') or '?'}")
+
+
+@cli.command(name="gitignore-list")
+def gitignore_list():
+    """List available .gitignore templates."""
+    items = _request("/gitignore/templates")
+    if not items:
+        click.echo("(none)")
+        return
+    click.echo(", ".join(items))
+
+
+@cli.command(name="gitignore-get")
+@click.argument("template")
+def gitignore_get(template):
+    """Get a .gitignore template source."""
+    text = _request(f"/gitignore/templates/{template}", raw=True)
+    click.echo(text)
+
+
+# ===========================================================================
+# Repositories
+# ===========================================================================
+@cli.command(name="repo-view")
+@click.argument("repo")
+def repo_view(repo):
+    """Show compact repository info."""
+    r = _request(f"/repos/{repo}")
+    desc = (r.get("description") or "").strip()
+    if desc:
+        click.echo(f"{r['full_name']}")
+        click.echo(desc)
+    else:
+        click.echo(f"{r['full_name']}")
+    license_name = (r.get("license") or {}).get("spdx_id") or "-"
+    topics = ", ".join(r.get("topics") or [])
+    click.echo(f"★ {r.get('stargazers_count', 0)} | forks {r.get('forks_count', 0)} | watchers {r.get('subscribers_count', 0)} | {r.get('language') or '-'} | {license_name}")
+    click.echo(f"visibility: {r.get('visibility', '?')} | archived: {r.get('archived', False)} | default: {r.get('default_branch', '?')} | pushed: {_d(r.get('pushed_at'))}")
+    if topics:
+        click.echo(f"topics: {topics}")
+    if r.get("homepage"):
+        click.echo(f"homepage: {r['homepage']}")
+    if r.get("open_issues_count") is not None:
+        click.echo(f"open issues: {r['open_issues_count']} | forks: {r.get('forks_count', 0)}")
+
+
+@cli.command(name="repo-list")
+@click.option("--owner", default=None, help="List repos for this user/org (default: self)")
+@click.option("--type", "repo_type", default=None, help="owner/member/public/private (self only)")
+@click.option("--visibility", default=None, help="public/private/all (self only)")
+@click.option("--sort", default="updated", help="created/updated/pushed/full_name")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def repo_list(owner, repo_type, visibility, sort, max_items):
+    """List repositories (self, user, or org)."""
+    _check_token()
+    params = {"sort": sort}
+    if owner:
+        path = f"/users/{owner}/repos"
+        if repo_type:
+            params["type"] = repo_type
+    else:
+        path = "/user/repos"
+        if repo_type:
+            params["type"] = repo_type
+        if visibility:
+            params["visibility"] = visibility
+        params["affiliation"] = "owner,collaborator,organization_member"
+    items = _get_list(path, max_items=max_items, **params)
+    if not items:
+        click.echo("(none)")
+        return
+    for r in items:
+        click.echo(_fmt_repo_line(r))
+    if len(items) == max_items:
+        click.echo(f"... ({max_items} shown, use --max to see more)")
+
+
+@cli.command(name="repo-clone")
+@click.argument("repo")
+@click.argument("dir", required=False)
+@click.option("--depth", type=int, default=None, help="Shallow clone depth")
+def repo_clone(repo, dir, depth):
+    """Clone a repository with git."""
+    cmd = ["git", "clone", f"https://github.com/{repo}.git"]
+    if depth:
+        cmd += ["--depth", str(depth)]
+    if dir:
+        cmd.append(dir)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        click.echo(f"Clone failed: {result.stderr.strip()}", err=True)
+        sys.exit(7)
+    click.echo("✓ Cloned")
+
+
+@cli.command(name="repo-fork")
+@click.argument("repo")
+@click.option("--org", default=None, help="Fork into an org instead of your account")
+def repo_fork(repo, org):
+    """Fork a repository."""
+    payload = {}
+    if org:
+        payload["organization"] = org
+    data = _request(f"/repos/{repo}/forks", method="POST", json=payload)
+    click.echo(f"✓ Forked: {data.get('full_name', repo)}")
+
+
+@cli.command(name="repo-delete")
+@click.argument("repo")
+@click.option("--yes", is_flag=True, default=False, help="Confirm deletion (required)")
+def repo_delete(repo, yes):
+    """Delete a repository (irreversible — requires --yes)."""
+    if not yes:
+        click.echo("This permanently deletes the repository. Add --yes to confirm.", err=True)
+        sys.exit(1)
+    _request(f"/repos/{repo}", method="DELETE")
+    click.echo(f"✓ Deleted {repo}")
+
+
+@cli.command(name="repo-update")
+@click.argument("repo")
+@click.option("--name", default=None, help="Rename repository")
+@click.option("--description", default=None, help="Set description")
+@click.option("--homepage", default=None, help="Set homepage URL")
+@click.option("--private", "private_", is_flag=True, default=None, help="Set private")
+@click.option("--public", "public_", is_flag=True, default=None, help="Set public")
+@click.option("--default-branch", "default_branch", default=None, help="Set default branch")
+def repo_update(repo, name, description, homepage, private_, public_, default_branch):
+    """Update repository metadata (rename, description, visibility, default branch)."""
+    payload = {}
+    if name:
+        payload["name"] = name
+    if description is not None:
+        payload["description"] = description
+    if homepage is not None:
+        payload["homepage"] = homepage
+    if private_:
+        payload["private"] = True
+    elif public_:
+        payload["private"] = False
+    if default_branch:
+        payload["default_branch"] = default_branch
+    if not payload:
+        click.echo("Nothing to update. Pass at least one of --name/--description/--homepage/--private/--public/--default-branch.", err=True)
+        sys.exit(1)
+    data = _request(f"/repos/{repo}", method="PATCH", json=payload)
+    click.echo(f"✓ Updated: {data.get('full_name', repo)}")
+
+
+@cli.command(name="repo-topics")
+@click.argument("repo")
+@click.option("--add", "add_topics", multiple=True, help="Add topic (repeatable)")
+@click.option("--remove", "remove_topics", multiple=True, help="Remove topic (repeatable)")
+@click.option("--set", "set_topics", multiple=True, help="Replace all topics with these")
+def repo_topics(repo, add_topics, remove_topics, set_topics):
+    """List or modify repository topics."""
+    accept = "application/vnd.github.mercy-preview+json"
+    if not (add_topics or remove_topics or set_topics):
+        data = _request(f"/repos/{repo}/topics", accept=accept)
+        names = data.get("names", [])
+        click.echo(", ".join(names) if names else "(no topics)")
+        return
+    current = _request(f"/repos/{repo}/topics", accept=accept).get("names", [])
+    if set_topics:
+        new_names = list(set_topics)
+    else:
+        new_names = list(current)
+        for t in add_topics:
+            if t not in new_names:
+                new_names.append(t)
+        for t in remove_topics:
+            if t in new_names:
+                new_names.remove(t)
+    _request(f"/repos/{repo}/topics", method="PUT", json={"names": new_names}, accept=accept)
+    click.echo("✓ Topics: " + ", ".join(new_names) if new_names else "✓ Topics cleared")
+
+
+@cli.command(name="repo-langs")
+@click.argument("repo")
+def repo_langs(repo):
+    """Show language breakdown (bytes and percent)."""
+    data = _request(f"/repos/{repo}/languages")
+    if not data:
+        click.echo("(no language data)")
+        return
+    total = sum(data.values())
+    for lang, bytes_ in sorted(data.items(), key=lambda kv: -kv[1]):
+        pct = (bytes_ / total * 100) if total else 0
+        click.echo(f"{lang}: {bytes_} bytes ({pct:.0f}%)")
+
+
+@cli.command(name="repo-contributors")
+@click.argument("repo")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def repo_contributors(repo, max_items):
+    """List top contributors by commit count."""
+    items = _get_list(f"/repos/{repo}/contributors", max_items=max_items)
+    if not items:
+        click.echo("(none)")
+        return
+    for c in items:
+        click.echo(f"{c.get('login', '?')}: {c.get('contributions', 0)} commits")
+
+
+@cli.command(name="repo-branches")
+@click.argument("repo")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def repo_branches(repo, max_items):
+    """List branches."""
+    items = _get_list(f"/repos/{repo}/branches", max_items=max_items)
+    if not items:
+        click.echo("(none)")
+        return
+    for b in items:
+        prot = " [protected]" if b.get("protected") else ""
+        click.echo(f"{b.get('name', '?')}{prot}")
+
+
+@cli.command(name="repo-tags")
+@click.argument("repo")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def repo_tags(repo, max_items):
+    """List tags."""
+    items = _get_list(f"/repos/{repo}/tags", max_items=max_items)
+    if not items:
+        click.echo("(none)")
+        return
+    for t in items:
+        click.echo(f"{t.get('name', '?')} {_sha7((t.get('commit') or {}).get('sha'))}")
+
+
+@cli.command(name="repo-license")
+@click.argument("repo")
+def repo_license(repo):
+    """Show repository license."""
+    data = _request(f"/repos/{repo}/license")
+    lic = data.get("license", {})
+    click.echo(f"name: {lic.get('name', '?')}")
+    click.echo(f"spdx_id: {lic.get('spdx_id') or '?'}")
+    click.echo(f"key: {lic.get('key', '?')}")
+    if data.get("path"):
+        click.echo(f"file: {data['path']}")
+
+
+@cli.command(name="repo-archive")
+@click.argument("repo")
+@click.option("--enable", "enable", is_flag=True, default=False, help="Archive")
+@click.option("--disable", "disable", is_flag=True, default=False, help="Unarchive")
+def repo_archive(repo, enable, disable):
+    """Archive or unarchive a repository."""
+    if enable == disable:
+        click.echo("Pass exactly one of --enable or --disable", err=True)
+        sys.exit(1)
+    data = _request(f"/repos/{repo}", method="PATCH", json={"archived": bool(enable)})
+    click.echo(f"✓ archived={data.get('archived', '?')}")
+
+
+# ===========================================================================
+# Contents
+# ===========================================================================
 @cli.command()
 @click.argument("repo")
 @click.option("--max", "max_results", type=int, default=200, help="Maximum file paths to return")
@@ -489,7 +1022,38 @@ def repo_tree(repo, max_results):
         click.echo(f"... (truncated: {total - max_results} more files)")
 
 
-# ---- file-read ----------------------------------------------------------
+@cli.command(name="dir-list")
+@click.argument("repo")
+@click.argument("path", required=False, default="")
+@click.option("--ref", "branch", default=None, help="Branch/tag/SHA")
+def dir_list(repo, path, branch):
+    """List directory contents (or show one file)."""
+    encoded = urllib.parse.quote(path, safe="")
+    qs = f"?ref={urllib.parse.quote(branch)}" if branch else ""
+    data = _request(f"/repos/{repo}/contents/{encoded}{qs}")
+    if isinstance(data, dict):
+        # Single file: decode base64 and print like file-read
+        content = data.get("content", "")
+        try:
+            text = base64.b64decode(content).decode("utf-8", errors="replace")
+        except Exception:
+            text = "(binary)"
+        lines = text.splitlines()
+        for i, line in enumerate(lines[:MAX_FILE_LINES], 1):
+            click.echo(f"{i}: {line}")
+        if len(lines) > MAX_FILE_LINES:
+            click.echo(f"... (truncated: {len(lines) - MAX_FILE_LINES} more lines)")
+        return
+    if not data:
+        click.echo("(empty)")
+        return
+    for item in data:
+        name = item.get("name", "?")
+        kind = "dir" if item.get("type") == "dir" else "file"
+        size = item.get("size", 0)
+        click.echo(f"{kind}\t{size}\t{name}")
+
+
 @cli.command()
 @click.argument("repo")
 @click.argument("path")
@@ -525,7 +1089,237 @@ def file_read(repo, path, start, end):
         click.echo(f"... (truncated: {total - MAX_FILE_LINES} more lines)")
 
 
-# ---- issue-view ---------------------------------------------------------
+@cli.command(name="file-write")
+@click.argument("repo")
+@click.argument("path")
+@click.option("--content", default=None, help="File content")
+@click.option("--file", "content_file", default=None, help="Read content from file")
+@click.option("--message", default=None, help="Commit message (required)")
+@click.option("--branch", default=None, help="Branch (default: repo default)")
+@click.option("--sha", default=None, help="Existing file SHA (required to update)")
+def file_write(repo, path, content, content_file, message, branch, sha):
+    """Create or update a file via the Contents API."""
+    if content is None and content_file:
+        try:
+            with open(content_file, "r") as f:
+                content = f.read()
+        except OSError as e:
+            click.echo(f"Cannot read file: {e}", err=True)
+            sys.exit(1)
+    if content is None and not sys.stdin.isatty():
+        content = sys.stdin.read()
+    if content is None:
+        click.echo("No content. Use --content, --file, or pipe on stdin.", err=True)
+        sys.exit(1)
+    if not message:
+        click.echo("--message is required", err=True)
+        sys.exit(1)
+    payload = {
+        "message": message,
+        "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+    }
+    if branch:
+        payload["branch"] = branch
+    if sha:
+        payload["sha"] = sha
+    data = _request(f"/repos/{repo}/contents/{urllib.parse.quote(path, safe='')}", method="PUT", json=payload)
+    commit = (data.get("commit") or {})
+    click.echo(f"✓ Written {path} | sha {_sha7(commit.get('sha'))} | {commit.get('message', '')[:60]}")
+
+
+@cli.command(name="file-delete")
+@click.argument("repo")
+@click.argument("path")
+@click.option("--message", default=None, help="Commit message (required)")
+@click.option("--branch", default=None, help="Branch (default: repo default)")
+@click.option("--sha", default=None, help="Existing file SHA (auto-fetched if omitted)")
+def file_delete(repo, path, message, branch, sha):
+    """Delete a file via the Contents API."""
+    if not message:
+        click.echo("--message is required", err=True)
+        sys.exit(1)
+    encoded = urllib.parse.quote(path, safe="")
+    if not sha:
+        qs = f"?ref={urllib.parse.quote(branch)}" if branch else ""
+        info = _request(f"/repos/{repo}/contents/{encoded}{qs}")
+        if isinstance(info, dict) and info.get("sha"):
+            sha = info["sha"]
+        else:
+            click.echo(f"Cannot resolve SHA for {path}", err=True)
+            sys.exit(1)
+    payload = {"message": message, "sha": sha}
+    if branch:
+        payload["branch"] = branch
+    data = _request(f"/repos/{repo}/contents/{encoded}", method="DELETE", json=payload)
+    commit = (data.get("commit") or {})
+    click.echo(f"✓ Deleted {path} | sha {_sha7(commit.get('sha'))}")
+
+
+@cli.command()
+@click.argument("repo")
+@click.option("--ref", "branch", default=None, help="Branch/tag/SHA")
+@click.option("--max", "max_lines", type=int, default=MAX_FILE_LINES, help="Max lines")
+def readme(repo, branch, max_lines):
+    """Show repository README (raw markdown, capped)."""
+    qs = f"?ref={urllib.parse.quote(branch)}" if branch else ""
+    text = _request(f"/repos/{repo}/readme{qs}", raw=True)
+    lines = text.splitlines()
+    total = len(lines)
+    for i, line in enumerate(lines[:max_lines], 1):
+        click.echo(f"{i}: {line}")
+    if total > max_lines:
+        click.echo(f"... (truncated: {total - max_lines} more lines)")
+
+
+# ===========================================================================
+# Commits & branches
+# ===========================================================================
+@cli.command(name="commit-list")
+@click.argument("repo")
+@click.option("--branch", "branch", default=None, help="Branch/SHA")
+@click.option("--path", "file_path", default=None, help="Only commits touching this path")
+@click.option("--author", default=None, help="Only commits by this author")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def commit_list(repo, branch, file_path, author, max_items):
+    """List commits."""
+    params = {}
+    if branch:
+        params["sha"] = branch
+    if file_path:
+        params["path"] = file_path
+    if author:
+        params["author"] = author
+    items = _get_list(f"/repos/{repo}/commits", max_items=max_items, **params)
+    if not items:
+        click.echo("(none)")
+        return
+    for c in items:
+        commit = c.get("commit", {})
+        author_name = commit.get("author", {}).get("name", "?")
+        date = _d(commit.get("author", {}).get("date"))
+        msg = (commit.get("message") or "").splitlines()[0]
+        click.echo(f"{_sha7(c.get('sha'))} | {author_name} | {date} | {msg[:100]}")
+
+
+@cli.command(name="commit-view")
+@click.argument("repo")
+@click.argument("sha")
+def commit_view(repo, sha):
+    """Show a commit: message, stats, changed files, status checks."""
+    data = _request(f"/repos/{repo}/commits/{sha}")
+    commit = data.get("commit", {})
+    click.echo(f"{sha} | {commit.get('author', {}).get('name', '?')} | {_d(commit.get('author', {}).get('date'))}")
+    msg = (commit.get("message") or "").strip()
+    for line in msg.splitlines():
+        click.echo(f"  {line}")
+    stats = data.get("stats", {})
+    click.echo(f"files: {len(data.get('files', []))}")
+    click.echo(f"stats: +{stats.get('additions', 0)} -{stats.get('deletions', 0)} ({stats.get('total', 0)})")
+    for f in data.get("files", []):
+        status = f.get("status", "?")
+        click.echo(f"  {status} {f.get('filename', '?')} +{f.get('additions', 0)} -{f.get('deletions', 0)}")
+    try:
+        status = _request(f"/repos/{repo}/commits/{sha}/status")
+        click.echo(f"status: {status.get('state', '?')} ({status.get('total_count', 0)} checks)")
+    except SystemExit:
+        pass
+
+
+@cli.command(name="commit-compare")
+@click.argument("repo")
+@click.argument("base")
+@click.argument("head")
+def commit_compare(repo, base, head):
+    """Compare two refs: gh-ai commit-compare o/r main...feature."""
+    data = _request(f"/repos/{repo}/compare/{base}...{head}")
+    click.echo(f"ahead: {data.get('ahead_by', 0)} | behind: {data.get('behind_by', 0)} | commits: {data.get('total_commits', 0)}")
+    for f in data.get("files", []):
+        status = f.get("status", "?")
+        click.echo(f"  {status} {f.get('filename', '?')} +{f.get('additions', 0)} -{f.get('deletions', 0)}")
+
+
+@cli.command(name="commit-search")
+@click.argument("query")
+@click.option("--max", "max_items", type=int, default=SEARCH_TOP, help="Max results")
+def commit_search(query, max_items):
+    """Search commits."""
+    encoded = urllib.parse.quote(query)
+    data = _request(f"/search/commits?q={encoded}&per_page={max(max_items, 1)}")
+    click.echo(_format_search_commits(data, max_items))
+
+
+@cli.command(name="branch-create")
+@click.argument("repo")
+@click.argument("name")
+@click.option("--sha", default=None, help="SHA to point at")
+@click.option("--from", "from_branch", default=None, help="Branch to branch from (default: default branch)")
+def branch_create(repo, name, sha, from_branch):
+    """Create a branch."""
+    if not sha:
+        if from_branch:
+            ref = _request(f"/repos/{repo}/git/ref/heads/{from_branch}")
+            sha = ref.get("object", {}).get("sha")
+        else:
+            r = _request(f"/repos/{repo}")
+            ref = _request(f"/repos/{repo}/git/ref/heads/{r.get('default_branch', 'main')}")
+            sha = ref.get("object", {}).get("sha")
+    if not sha:
+        click.echo("Cannot resolve base SHA", err=True)
+        sys.exit(1)
+    _request(f"/repos/{repo}/git/refs", method="POST", json={"ref": f"refs/heads/{name}", "sha": sha})
+    click.echo(f"✓ Branch {name} created at {_sha7(sha)}")
+
+
+@cli.command(name="branch-delete")
+@click.argument("repo")
+@click.argument("name")
+@click.option("--yes", is_flag=True, default=False, help="Confirm deletion (required)")
+def branch_delete(repo, name, yes):
+    """Delete a branch (requires --yes)."""
+    if not yes:
+        click.echo("Add --yes to confirm branch deletion.", err=True)
+        sys.exit(1)
+    _request(f"/repos/{repo}/git/refs/heads/{name}", method="DELETE")
+    click.echo(f"✓ Branch {name} deleted")
+
+
+# ===========================================================================
+# Issues
+# ===========================================================================
+@cli.command(name="issue-list")
+@click.argument("repo")
+@click.option("--state", default="open", help="open/closed/all")
+@click.option("--label", default=None, help="Filter by label")
+@click.option("--assignee", default=None, help="Filter by assignee (or 'none')")
+@click.option("--author", default=None, help="Filter by author")
+@click.option("--sort", default="created", help="created/updated/comments")
+@click.option("--direction", default="desc", help="asc/desc")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def issue_list(repo, state, label, assignee, author, sort, direction, max_items):
+    """List issues (PRs excluded)."""
+    params = {"state": state, "sort": sort, "direction": direction}
+    if label:
+        params["label"] = label
+    if assignee:
+        params["assignee"] = assignee
+    if author:
+        params["creator"] = author
+    items = _get_list(f"/repos/{repo}/issues", max_items=max_items, **params)
+    if not items:
+        click.echo("(none)")
+        return
+    for i in items:
+        if "pull_request" in i:
+            continue
+        labels = _fmt_labels(i.get("labels"))
+        author_name = _login(i.get("user"))
+        title = i.get("title", "")
+        num = i.get("number", "?")
+        state_icon = "open" if i.get("state") == "open" else "closed"
+        label_str = f" [{labels}]" if labels else ""
+        click.echo(f"#{num}{label_str} {title} ({state_icon}) @{author_name}")
+
+
 @cli.command()
 @click.argument("repo")
 @click.argument("issue_number", type=int)
@@ -554,14 +1348,14 @@ def issue_view(repo, issue_number):
     click.echo(_format_issue(issue, comments))
 
 
-# ---- issue-create -------------------------------------------------------
-@cli.command()
+@cli.command(name="issue-create")
 @click.argument("repo")
 @click.option("--title", required=True, help="Issue title")
 @click.option("--body", default=None, help="Issue body text")
 @click.option("--body-file", default=None, help="Read body from file")
 @click.option("--label", "labels", multiple=True, help="Add label (repeatable)")
-def issue_create(repo, title, body, body_file, labels):
+@click.option("--assignee", "assignees", multiple=True, help="Assign to user (repeatable)")
+def issue_create(repo, title, body, body_file, labels, assignees):
     """Create a new issue."""
     _check_token()
 
@@ -569,12 +1363,192 @@ def issue_create(repo, title, body, body_file, labels):
     payload = {"title": title, "body": resolved_body}
     if labels:
         payload["labels"] = list(labels)
+    if assignees:
+        payload["assignees"] = list(assignees)
 
     data = _request(f"/repos/{repo}/issues", method="POST", json=payload)
     click.echo(f"✓ Issue #{data['number']} created: {data['html_url']}")
 
 
-# ---- pr-view ------------------------------------------------------------
+@cli.command(name="issue-update")
+@click.argument("repo")
+@click.argument("issue_number", type=int)
+@click.option("--title", default=None, help="New title")
+@click.option("--body", default=None, help="New body")
+@click.option("--state", type=click.Choice(["open", "closed"]), default=None, help="Set state")
+@click.option("--label", "labels", multiple=True, help="Replace labels with these")
+@click.option("--add-label", "add_labels", multiple=True, help="Add label (keep existing)")
+@click.option("--remove-label", "remove_labels", multiple=True, help="Remove label")
+@click.option("--assignee", "assignees", multiple=True, help="Replace assignees")
+@click.option("--add-assignee", "add_assignees", multiple=True, help="Add assignee")
+@click.option("--remove-assignee", "remove_assignees", multiple=True, help="Remove assignee")
+@click.option("--milestone", type=int, default=None, help="Set milestone number")
+def issue_update(repo, issue_number, title, body, state, labels, add_labels, remove_labels,
+                 assignees, add_assignees, remove_assignees, milestone):
+    """Update an issue: title, body, state, labels, assignees, milestone."""
+    payload = {}
+    if title is not None:
+        payload["title"] = title
+    if body is not None:
+        payload["body"] = body
+    if state is not None:
+        payload["state"] = state
+    if milestone is not None:
+        payload["milestone"] = milestone
+
+    if labels or add_labels or remove_labels:
+        current = [l.get("name") for l in _request(f"/repos/{repo}/issues/{issue_number}").get("labels", [])]
+        if labels:
+            new_labels = list(labels)
+        else:
+            new_labels = current
+            for l in add_labels:
+                if l not in new_labels:
+                    new_labels.append(l)
+            for l in remove_labels:
+                if l in new_labels:
+                    new_labels.remove(l)
+        payload["labels"] = new_labels
+
+    if assignees or add_assignees or remove_assignees:
+        current_as = [a.get("login") for a in _request(f"/repos/{repo}/issues/{issue_number}").get("assignees", [])]
+        if assignees:
+            new_as = list(assignees)
+        else:
+            new_as = current_as
+            for a in add_assignees:
+                if a not in new_as:
+                    new_as.append(a)
+            for a in remove_assignees:
+                if a in new_as:
+                    new_as.remove(a)
+        payload["assignees"] = new_as
+
+    if not payload:
+        click.echo("Nothing to update.", err=True)
+        sys.exit(1)
+    data = _request(f"/repos/{repo}/issues/{issue_number}", method="PATCH", json=payload)
+    click.echo(f"✓ Issue #{issue_number} updated: {data.get('title', '')}")
+
+
+@cli.command(name="issue-close")
+@click.argument("repo")
+@click.argument("issue_number", type=int)
+def issue_close(repo, issue_number):
+    """Close an issue."""
+    _request(f"/repos/{repo}/issues/{issue_number}", method="PATCH", json={"state": "closed"})
+    click.echo(f"✓ Issue #{issue_number} closed")
+
+
+@cli.command(name="issue-reopen")
+@click.argument("repo")
+@click.argument("issue_number", type=int)
+def issue_reopen(repo, issue_number):
+    """Reopen an issue."""
+    _request(f"/repos/{repo}/issues/{issue_number}", method="PATCH", json={"state": "open"})
+    click.echo(f"✓ Issue #{issue_number} reopened")
+
+
+@cli.command(name="issue-labels")
+@click.argument("repo")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def issue_labels(repo, max_items):
+    """List labels in a repository."""
+    items = _get_list(f"/repos/{repo}/labels", max_items=max_items)
+    if not items:
+        click.echo("(none)")
+        return
+    for l in items:
+        click.echo(f"{l.get('name', '?')} ({l.get('color', '?')})")
+
+
+@cli.command(name="issue-milestones")
+@click.argument("repo")
+@click.option("--state", default="open", help="open/closed/all")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def issue_milestones(repo, state, max_items):
+    """List milestones."""
+    items = _get_list(f"/repos/{repo}/milestones", max_items=max_items, state=state)
+    if not items:
+        click.echo("(none)")
+        return
+    for m in items:
+        due = _d(m.get("due_on"))
+        pct = m.get("open_issues", 0) + m.get("closed_issues", 0)
+        click.echo(f"#{m.get('number', '?')} {m.get('title', '?')} | {m.get('state', '?')} | {m.get('open_issues', 0)}/{pct} open | due {due or '-'}")
+
+
+@cli.command(name="issue-milestone-create")
+@click.argument("repo")
+@click.argument("title")
+@click.option("--description", default=None, help="Milestone description")
+@click.option("--due-on", "due_on", default=None, help="Due date YYYY-MM-DD")
+def issue_milestone_create(repo, title, description, due_on):
+    """Create a milestone."""
+    payload = {"title": title}
+    if description is not None:
+        payload["description"] = description
+    if due_on:
+        payload["due_on"] = due_on + "T00:00:00Z"
+    data = _request(f"/repos/{repo}/milestones", method="POST", json=payload)
+    click.echo(f"✓ Milestone #{data.get('number', '?')}: {data.get('title', '')}")
+
+
+@cli.command(name="issue-events")
+@click.argument("repo")
+@click.argument("issue_number", type=int)
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def issue_events(repo, issue_number, max_items):
+    """Show issue timeline events."""
+    items = _get_list(f"/repos/{repo}/issues/{issue_number}/events", max_items=max_items)
+    if not items:
+        click.echo("(none)")
+        return
+    for e in items:
+        actor = _login(e.get("actor"))
+        event = e.get("event", "?")
+        label = (e.get("label") or {}).get("name", "")
+        created = _d(e.get("created_at"))
+        extra = f" {label}" if label else ""
+        click.echo(f"{created} | {actor} | {event}{extra}")
+
+
+# ===========================================================================
+# Pull requests
+# ===========================================================================
+@cli.command(name="pr-list")
+@click.argument("repo")
+@click.option("--state", default="open", help="open/closed/all")
+@click.option("--author", default=None, help="Filter by author")
+@click.option("--label", default=None, help="Filter by label")
+@click.option("--head", default=None, help="Filter by head branch (user:branch)")
+@click.option("--base", default=None, help="Filter by base branch")
+@click.option("--sort", default="created", help="created/updated/popularity/long-running")
+@click.option("--direction", default="desc", help="asc/desc")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def pr_list(repo, state, author, label, head, base, sort, direction, max_items):
+    """List pull requests."""
+    params = {"state": state, "sort": sort, "direction": direction}
+    if author:
+        params["head"] = f"{author}:"
+    if label:
+        params["label"] = label
+    if head:
+        params["head"] = head
+    if base:
+        params["base"] = base
+    items = _get_list(f"/repos/{repo}/pulls", max_items=max_items, **params)
+    if not items:
+        click.echo("(none)")
+        return
+    for p in items:
+        author_name = _login(p.get("user"))
+        draft = " [draft]" if p.get("draft") else ""
+        adds = p.get("additions")
+        diff = f" +{adds}-{p.get('deletions', 0)}" if adds is not None else ""
+        click.echo(f"#{p.get('number', '?')} {p.get('title', '?')} ({p.get('state', '?')}{draft}) @{author_name}{diff}")
+
+
 @cli.command()
 @click.argument("repo")
 @click.argument("pr_number", type=int)
@@ -609,8 +1583,219 @@ def pr_view(repo, pr_number):
     click.echo(_format_pr(pr, reviews))
 
 
-# ---- pr-checks ----------------------------------------------------------
+@cli.command(name="pr-create")
+@click.argument("repo")
+@click.option("--title", required=True, help="PR title")
+@click.option("--head", required=True, help="Head branch (or user:branch)")
+@click.option("--base", required=True, help="Base branch")
+@click.option("--body", default=None, help="PR description")
+@click.option("--body-file", default=None, help="Read PR description from file")
+@click.option("--draft", is_flag=True, default=False, help="Create as draft")
+def pr_create(repo, title, head, base, body, body_file, draft):
+    """Create a PR via API (branch must already be pushed)."""
+    _check_token()
+    resolved_body = _require_body(body, body_file)
+    payload = {"title": title, "head": head, "base": base, "body": resolved_body, "draft": draft}
+    data = _request(f"/repos/{repo}/pulls", method="POST", json=payload)
+    click.echo(f"✓ PR #{data['number']} created: {data['html_url']}")
+
+
+@cli.command(name="pr-update")
+@click.argument("repo")
+@click.argument("pr_number", type=int)
+@click.option("--title", default=None, help="New title")
+@click.option("--body", default=None, help="New body")
+@click.option("--state", type=click.Choice(["open", "closed"]), default=None, help="Set state")
+@click.option("--base", default=None, help="Change base branch")
+def pr_update(repo, pr_number, title, body, state, base):
+    """Update a PR: title, body, state, base branch."""
+    payload = {}
+    if title is not None:
+        payload["title"] = title
+    if body is not None:
+        payload["body"] = body
+    if state is not None:
+        payload["state"] = state
+    if base is not None:
+        payload["base"] = base
+    if not payload:
+        click.echo("Nothing to update.", err=True)
+        sys.exit(1)
+    data = _request(f"/repos/{repo}/pulls/{pr_number}", method="PATCH", json=payload)
+    click.echo(f"✓ PR #{pr_number} updated: {data.get('title', '')}")
+
+
+@cli.command(name="pr-close")
+@click.argument("repo")
+@click.argument("pr_number", type=int)
+def pr_close(repo, pr_number):
+    """Close a PR without merging."""
+    _request(f"/repos/{repo}/pulls/{pr_number}", method="PATCH", json={"state": "closed"})
+    click.echo(f"✓ PR #{pr_number} closed")
+
+
 @cli.command()
+@click.argument("repo")
+@click.argument("pr_number", type=int)
+@click.option("--squash", is_flag=True, default=False, help="Squash and merge")
+@click.option("--rebase", is_flag=True, default=False, help="Rebase and merge")
+@click.option("--delete-branch", is_flag=True, default=False, help="Delete head branch after merge")
+@click.option("--commit-title", default=None, help="Custom merge commit title")
+@click.option("--commit-message", default=None, help="Custom merge commit message")
+def pr_merge(repo, pr_number, squash, rebase, delete_branch, commit_title, commit_message):
+    """Merge a PR. Defaults to standard merge commit."""
+    _check_token()
+
+    if squash and rebase:
+        click.echo("Cannot use both --squash and --rebase", err=True)
+        sys.exit(1)
+
+    method = "squash" if squash else "rebase" if rebase else "merge"
+    payload = {"merge_method": method}
+    if delete_branch:
+        payload["delete_branch"] = True
+    if commit_title:
+        payload["commit_title"] = commit_title
+    if commit_message:
+        payload["commit_message"] = commit_message
+
+    data = _request(
+        f"/repos/{repo}/pulls/{pr_number}/merge",
+        method="PUT",
+        json=payload,
+    )
+    if data.get("merged"):
+        msg = "✓ Merged"
+        if delete_branch:
+            msg += " (branch deleted)"
+        click.echo(f"{msg}: {data.get('message', '')}")
+    else:
+        click.echo(f"Merge failed: {data.get('message', 'unknown')}", err=True)
+        sys.exit(6)
+
+
+@cli.command(name="pr-comment")
+@click.argument("repo")
+@click.argument("number", type=int)
+@click.option("--body", default=None, help="Comment text")
+@click.option("--body-file", default=None, help="Read comment from file")
+def pr_comment(repo, number, body, body_file):
+    """Add a comment to an issue or pull request."""
+    _check_token()
+
+    resolved_body = _require_body(body, body_file)
+    data = _request(
+        f"/repos/{repo}/issues/{number}/comments",
+        method="POST",
+        json={"body": resolved_body},
+    )
+    click.echo(f"✓ Comment added: {data['html_url']}")
+
+
+@cli.command(name="pr-review")
+@click.argument("repo")
+@click.argument("pr_number", type=int)
+@click.option("--event", type=click.Choice(["approve", "request_changes", "comment"]), default=None,
+              help="Review event")
+@click.option("--approve", "approve_flag", is_flag=True, default=False, help="Shorthand for --event approve")
+@click.option("--request-changes", "request_changes_flag", is_flag=True, default=False,
+              help="Shorthand for --event request_changes")
+@click.option("--body", default=None, help="Review summary")
+@click.option("--body-file", default=None, help="Read review summary from file")
+def pr_review(repo, pr_number, event, approve_flag, request_changes_flag, body, body_file):
+    """Submit a PR review (approve / request changes / comment)."""
+    _check_token()
+    if approve_flag:
+        event = "approve"
+    elif request_changes_flag:
+        event = "request_changes"
+    if event is None:
+        event = "comment"
+    resolved = _resolve_body(body, body_file)
+    event_map = {"approve": "APPROVE", "request_changes": "REQUEST_CHANGES", "comment": "COMMENT"}
+    payload = {"event": event_map[event]}
+    if resolved:
+        payload["body"] = resolved
+    data = _request(f"/repos/{repo}/pulls/{pr_number}/reviews", method="POST", json=payload)
+    click.echo(f"✓ Review {event} submitted (id {data.get('id', '?')})")
+
+
+@cli.command(name="pr-review-comment")
+@click.argument("repo")
+@click.argument("pr_number", type=int)
+@click.option("--path", required=True, help="File path")
+@click.option("--line", type=int, required=True, help="Line number in the diff")
+@click.option("--body", default=None, help="Comment text")
+@click.option("--body-file", default=None, help="Read comment from file")
+def pr_review_comment(repo, pr_number, path, line, body, body_file):
+    """Add an inline code review comment on a PR diff line."""
+    _check_token()
+    resolved = _require_body(body, body_file)
+    payload = {"body": resolved, "path": path, "line": line, "side": "RIGHT"}
+    data = _request(f"/repos/{repo}/pulls/{pr_number}/comments", method="POST", json=payload)
+    click.echo(f"✓ Inline comment on {path}:{line}")
+
+
+@cli.command(name="pr-comments")
+@click.argument("repo")
+@click.argument("pr_number", type=int)
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def pr_comments(repo, pr_number, max_items):
+    """List all comments on a PR (issue comments + review comments + review summaries)."""
+    issue_comments = _get_list(f"/repos/{repo}/issues/{pr_number}/comments", max_items=max_items)
+    review_comments = _get_list(f"/repos/{repo}/pulls/{pr_number}/comments", max_items=max_items)
+    reviews = _get_list(f"/repos/{repo}/pulls/{pr_number}/reviews", max_items=max_items)
+    if not issue_comments and not review_comments and not reviews:
+        click.echo("(no comments)")
+        return
+    for c in issue_comments:
+        click.echo(f"[issue] {_login(c.get('user'))} | {_d(c.get('created_at'))} | {(c.get('body') or '').replace(chr(10), ' ')[:120]}")
+    for c in review_comments:
+        loc = f" {c.get('path')}:{c.get('line') or c.get('original_line')}" if c.get("path") else ""
+        click.echo(f"[review]{loc} {_login(c.get('user'))} | {_d(c.get('created_at'))} | {(c.get('body') or '').replace(chr(10), ' ')[:120]}")
+    for r in reviews:
+        state = r.get("state", "")
+        body = (r.get("body") or "").replace(chr(10), " ")[:120]
+        click.echo(f"[summary:{state}] {_login(r.get('user'))} | {_d(r.get('submitted_at'))} | {body}")
+
+
+@cli.command(name="pr-files")
+@click.argument("repo")
+@click.argument("pr_number", type=int)
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def pr_files(repo, pr_number, max_items):
+    """List files changed by a PR."""
+    items = _get_list(f"/repos/{repo}/pulls/{pr_number}/files", max_items=max_items)
+    if not items:
+        click.echo("(none)")
+        return
+    for f in items:
+        click.echo(f"{f.get('status', '?')} {f.get('filename', '?')} +{f.get('additions', 0)} -{f.get('deletions', 0)}")
+
+
+@cli.command(name="pr-reviewers")
+@click.argument("repo")
+@click.argument("pr_number", type=int)
+@click.option("--add", "add_users", multiple=True, help="Request review from user (repeatable)")
+@click.option("--remove", "remove_users", multiple=True, help="Remove requested reviewer (repeatable)")
+def pr_reviewers(repo, pr_number, add_users, remove_users):
+    """Add or remove requested reviewers."""
+    if not (add_users or remove_users):
+        data = _request(f"/repos/{repo}/pulls/{pr_number}/requested_reviewers")
+        names = [r.get("login", "?") for r in data.get("users", [])]
+        click.echo(", ".join(names) if names else "(none requested)")
+        return
+    if add_users:
+        _request(f"/repos/{repo}/pulls/{pr_number}/requested_reviewers",
+                 method="POST", json={"reviewers": list(add_users)})
+        click.echo(f"✓ Requested: {', '.join(add_users)}")
+    if remove_users:
+        _request(f"/repos/{repo}/pulls/{pr_number}/requested_reviewers",
+                 method="DELETE", json={"reviewers": list(remove_users)})
+        click.echo(f"✓ Removed: {', '.join(remove_users)}")
+
+
+@cli.command(name="pr-checks")
 @click.argument("repo")
 @click.argument("pr_number", type=int)
 def pr_checks(repo, pr_number):
@@ -641,8 +1826,7 @@ def pr_checks(repo, pr_number):
     click.echo(_format_checks(runs))
 
 
-# ---- pr-diff ------------------------------------------------------------
-@cli.command()
+@cli.command(name="pr-diff")
 @click.argument("repo")
 @click.argument("pr_number", type=int)
 @click.option("--max-lines", type=int, default=300, help="Maximum diff lines (default 300)")
@@ -672,8 +1856,7 @@ def pr_diff(repo, pr_number, max_lines):
         click.echo(f"... (truncated: {total - max_lines} more lines)")
 
 
-# ---- pr-status ----------------------------------------------------------
-@cli.command()
+@cli.command(name="pr-status")
 @click.argument("repo")
 @click.argument("pr_number", type=int)
 def pr_status(repo, pr_number):
@@ -717,78 +1900,125 @@ def pr_status(repo, pr_number):
     click.echo(f"{status}{' ' + draft if draft else ''} | mergeable: {mergeable} | ci: {ci} | {pr['html_url']}")
 
 
-# ---- pr-merge -----------------------------------------------------------
-@cli.command()
+# ===========================================================================
+# GitHub Actions
+# ===========================================================================
+@cli.command(name="action-list")
 @click.argument("repo")
-@click.argument("pr_number", type=int)
-@click.option("--squash", is_flag=True, default=False, help="Squash and merge")
-@click.option("--rebase", is_flag=True, default=False, help="Rebase and merge")
-@click.option("--delete-branch", is_flag=True, default=False, help="Delete head branch after merge")
-def pr_merge(repo, pr_number, squash, rebase, delete_branch):
-    """Merge a PR. Defaults to standard merge commit."""
-    _check_token()
-
-    if squash and rebase:
-        click.echo("Cannot use both --squash and --rebase", err=True)
-        sys.exit(1)
-
-    method = "squash" if squash else "rebase" if rebase else "merge"
-    payload = {"merge_method": method}
-    if delete_branch:
-        payload["delete_branch"] = True
-
-    data = _request(
-        f"/repos/{repo}/pulls/{pr_number}/merge",
-        method="PUT",
-        json=payload,
-    )
-    if data.get("merged"):
-        msg = "✓ Merged"
-        if delete_branch:
-            msg += " (branch deleted)"
-        click.echo(f"{msg}: {data.get('message', '')}")
-    else:
-        click.echo(f"Merge failed: {data.get('message', 'unknown')}", err=True)
-        sys.exit(6)
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def action_list(repo, max_items):
+    """List workflows in a repository."""
+    items = _get_list(f"/repos/{repo}/actions/workflows", max_items=max_items)
+    if not items:
+        click.echo("(none)")
+        return
+    for w in items:
+        click.echo(f"{w.get('name', '?')} | {w.get('path', '?')} | {w.get('state', '?')}")
 
 
-# ---- pr-comment ---------------------------------------------------------
-@cli.command()
+@cli.command(name="action-runs")
 @click.argument("repo")
-@click.argument("number", type=int)
-@click.option("--body", default=None, help="Comment text")
-@click.option("--body-file", default=None, help="Read comment from file")
-def pr_comment(repo, number, body, body_file):
-    """Add a comment to an issue or pull request."""
-    _check_token()
-
-    resolved_body = _require_body(body, body_file)
-    data = _request(
-        f"/repos/{repo}/issues/{number}/comments",
-        method="POST",
-        json={"body": resolved_body},
-    )
-    click.echo(f"✓ Comment added: {data['html_url']}")
-
-
-# ---- search -------------------------------------------------------------
-@cli.command()
-@click.argument("query")
-@click.option("--type", "search_type", type=click.Choice(["repos", "issues"]), default="repos",
-              help="Search repositories or issues")
-def search(query, search_type):
-    """Search GitHub repositories or issues. Returns top 5 results."""
-    encoded = urllib.parse.quote(query)
-    if search_type == "repos":
-        data = _request(f"/search/repositories?q={encoded}&per_page=5&sort=stars&order=desc")
-        click.echo(_format_search_repos(data))
-    else:
-        data = _request(f"/search/issues?q={encoded}&per_page=5&sort=created&order=desc")
-        click.echo(_format_search_issues(data))
+@click.option("--branch", default=None, help="Filter by branch")
+@click.option("--status", default=None, help="Filter by status: completed/queued/in_progress/..."
+              " or conclusion: success/failure/cancelled")
+@click.option("--event", default=None, help="Filter by trigger event (push, pull_request, ...)")
+@click.option("--workflow", default=None, help="Filter by workflow file name or ID")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def action_runs(repo, branch, status, event, workflow, max_items):
+    """List workflow runs."""
+    params = {}
+    if branch:
+        params["branch"] = branch
+    if status:
+        params["status"] = status
+    if event:
+        params["event"] = event
+    if workflow:
+        params["workflow_id"] = workflow
+    items = _get_list(f"/repos/{repo}/actions/runs", max_items=max_items, **params)
+    if not items:
+        click.echo("(none)")
+        return
+    for r in items:
+        conclusion = r.get("conclusion") or r.get("status", "?")
+        icon = "✓" if conclusion == "success" else "✗" if conclusion in ("failure", "cancelled", "timed_out") else "○"
+        title = (r.get("display_title") or r.get("name") or "?").replace("\n", " ")[:60]
+        click.echo(f"{icon} {r.get('id', '?')} | {title} | {r.get('head_branch', '?')} | {r.get('event', '?')} | {conclusion} | {_sha7(r.get('head_sha'))}")
 
 
-# ---- get-action-errors --------------------------------------------------
-@cli.command()
+@cli.command(name="action-run")
+@click.argument("repo")
+@click.argument("run_id")
+def action_run(repo, run_id):
+    """View a single workflow run with its jobs and steps."""
+    r = _request(f"/repos/{repo}/actions/runs/{run_id}")
+    conclusion = r.get("conclusion") or r.get("status", "?")
+    click.echo(f"run {r.get('id', '?')} | {(r.get('display_title') or r.get('name') or '?')[:80]}")
+    click.echo(f"branch: {r.get('head_branch', '?')} | event: {r.get('event', '?')} | conclusion: {conclusion}")
+    click.echo(f"sha: {_sha7(r.get('head_sha'))} | created: {_d(r.get('created_at'))} | duration: {(r.get('updated_at') or '')[:19]}")
+    jobs = _get_list(f"/repos/{repo}/actions/runs/{run_id}/jobs", max_items=50)
+    for j in jobs:
+        jc = j.get("conclusion") or j.get("status", "?")
+        icon = "✓" if jc == "success" else "✗" if jc in ("failure", "cancelled", "timed_out") else "○"
+        click.echo(f"  {icon} job: {j.get('name', '?')} | {jc}")
+        for step in j.get("steps", []):
+            sc = step.get("conclusion") or step.get("status", "?")
+            click.echo(f"      - {step.get('name', '?')}: {sc}")
+
+
+@cli.command(name="action-jobs")
+@click.argument("repo")
+@click.argument("run_id")
+def action_jobs(repo, run_id):
+    """List jobs for a workflow run."""
+    jobs = _get_list(f"/repos/{repo}/actions/runs/{run_id}/jobs", max_items=50)
+    if not jobs:
+        click.echo("(none)")
+        return
+    for j in jobs:
+        jc = j.get("conclusion") or j.get("status", "?")
+        icon = "✓" if jc == "success" else "✗" if jc in ("failure", "cancelled", "timed_out") else "○"
+        click.echo(f"{icon} {j.get('name', '?')} | {jc} | {j.get('runner_name') or j.get('runner_group_name') or ''}")
+
+
+@cli.command(name="action-trigger")
+@click.argument("repo")
+@click.argument("workflow")
+@click.option("--ref", "branch", required=True, help="Branch/tag to run on")
+@click.option("--inputs", default=None, help='JSON inputs, e.g. \'{"env":"prod"}\'')
+def action_trigger(repo, workflow, branch, inputs):
+    """Trigger a workflow_dispatch event."""
+    payload = {"ref": branch}
+    if inputs:
+        try:
+            payload["inputs"] = json_parse(inputs)
+        except Exception:
+            payload["inputs"] = {"text": inputs}
+    _request(f"/repos/{repo}/actions/workflows/{workflow}/dispatches", method="POST", json=payload)
+    click.echo(f"✓ Dispatched {workflow} on {branch}")
+
+
+@cli.command(name="action-cancel")
+@click.argument("repo")
+@click.argument("run_id")
+def action_cancel(repo, run_id):
+    """Cancel a workflow run."""
+    _request(f"/repos/{repo}/actions/runs/{run_id}/cancel", method="POST")
+    click.echo(f"✓ Cancel requested for run {run_id}")
+
+
+@cli.command(name="action-rerun")
+@click.argument("repo")
+@click.argument("run_id")
+@click.option("--failed", "failed_only", is_flag=True, default=False, help="Rerun only failed jobs")
+def action_rerun(repo, run_id, failed_only):
+    """Rerun a workflow run (or only failed jobs)."""
+    endpoint = "rerun-failed-jobs" if failed_only else "rerun"
+    _request(f"/repos/{repo}/actions/runs/{run_id}/{endpoint}", method="POST")
+    click.echo(f"✓ Rerun requested for run {run_id}")
+
+
+@cli.command(name="get-action-errors")
 @click.argument("repo")
 @click.argument("run_id")
 def get_action_errors(repo, run_id):
@@ -818,8 +2048,498 @@ def get_action_errors(repo, run_id):
     click.echo(_format_log_errors(log_text))
 
 
-# ---- apply-patch --------------------------------------------------------
+@cli.command(name="action-secret")
+@click.argument("repo")
+@click.option("--set", "secret_name", default=None, help="Secret name to set")
+@click.option("--value", default=None, help="Secret value (for --set)")
+@click.option("--value-file", default=None, help="Read secret value from file")
+@click.option("--delete", "delete_name", default=None, help="Secret name to delete")
+def action_secret(repo, secret_name, value, value_file, delete_name):
+    """Manage Actions secrets: list (default), --set name --value, --delete name."""
+    if delete_name:
+        _request(f"/repos/{repo}/actions/secrets/{delete_name}", method="DELETE")
+        click.echo(f"✓ Secret {delete_name} deleted")
+        return
+    if secret_name:
+        if value is None and value_file:
+            try:
+                with open(value_file, "r") as f:
+                    value = f.read()
+            except OSError as e:
+                click.echo(f"Cannot read value file: {e}", err=True)
+                sys.exit(1)
+        if value is None:
+            click.echo("--value or --value-file required with --set", err=True)
+            sys.exit(1)
+        key = _request(f"/repos/{repo}/actions/secrets/public-key")
+        encrypted = _encrypt_secret(key.get("key", ""), value)
+        _request(f"/repos/{repo}/actions/secrets/{secret_name}", method="PUT",
+                 json={"encrypted_value": encrypted, "key_id": key.get("key_id", "")})
+        click.echo(f"✓ Secret {secret_name} set")
+        return
+    data = _request(f"/repos/{repo}/actions/secrets")
+    names = [s.get("name") for s in data.get("secrets", [])]
+    click.echo(", ".join(names) if names else "(no secrets)")
+
+
+@cli.command(name="action-variable")
+@click.argument("repo")
+@click.option("--set", "var_name", default=None, help="Variable name to set")
+@click.option("--value", default=None, help="Variable value (for --set)")
+@click.option("--delete", "delete_name", default=None, help="Variable name to delete")
+def action_variable(repo, var_name, value, delete_name):
+    """Manage Actions variables: list (default), --set name --value, --delete name."""
+    if delete_name:
+        _request(f"/repos/{repo}/actions/variables/{delete_name}", method="DELETE")
+        click.echo(f"✓ Variable {delete_name} deleted")
+        return
+    if var_name:
+        if value is None:
+            click.echo("--value required with --set", err=True)
+            sys.exit(1)
+        # Probe existence without hard-exiting on 404 (new variable)
+        resp = requests.get(f"{BASE_URL}/repos/{repo}/actions/variables/{var_name}",
+                            headers=_headers(), timeout=30)
+        if resp.status_code == 404:
+            _request(f"/repos/{repo}/actions/variables", method="POST",
+                     json={"name": var_name, "value": value})
+            click.echo(f"✓ Variable {var_name} set (created)")
+        elif resp.status_code >= 400:
+            _fail_status(resp, f"/repos/{repo}/actions/variables/{var_name}")
+        else:
+            _request(f"/repos/{repo}/actions/variables/{var_name}", method="PATCH",
+                     json={"value": value})
+            click.echo(f"✓ Variable {var_name} set (updated)")
+        return
+    data = _request(f"/repos/{repo}/actions/variables")
+    vars_ = data.get("variables", [])
+    if not vars_:
+        click.echo("(no variables)")
+        return
+    for v in vars_:
+        click.echo(f"{v.get('name', '?')} = {v.get('value', '')}")
+
+
+@cli.command(name="action-cache")
+@click.argument("repo")
+def action_cache(repo):
+    """List Actions caches."""
+    data = _request(f"/repos/{repo}/actions/caches")
+    caches = data.get("actions_caches", [])
+    total = data.get("total_size_in_bytes", 0)
+    if not caches:
+        click.echo("(no caches)")
+        return
+    for c in caches:
+        click.echo(f"{c.get('key', '?')} | {c.get('ref', '?')} | {c.get('size_in_bytes', 0)} bytes | {_d(c.get('created_at'))}")
+    click.echo(f"total: {total} bytes")
+
+
+# ===========================================================================
+# Search
+# ===========================================================================
 @cli.command()
+@click.argument("query")
+@click.option("--type", "search_type", type=click.Choice(["repos", "issues", "code", "users", "commits", "topics"]),
+              default="repos", help="What to search")
+@click.option("--max", "max_items", type=int, default=SEARCH_TOP, help="Max results (cap 20)")
+def search(query, search_type, max_items):
+    """Search GitHub. Types: repos, issues, code, users, commits, topics."""
+    encoded = urllib.parse.quote(query)
+    per = min(max(max_items, 1), 20)
+    if search_type == "repos":
+        data = _request(f"/search/repositories?q={encoded}&per_page={per}&sort=stars&order=desc")
+        click.echo(_format_search_repos(data, max_items))
+    elif search_type == "issues":
+        data = _request(f"/search/issues?q={encoded}&per_page={per}&sort=created&order=desc")
+        click.echo(_format_search_issues(data, max_items))
+    elif search_type == "code":
+        data = _request(f"/search/code?q={encoded}&per_page={per}")
+        click.echo(_format_search_code(data, max_items))
+    elif search_type == "users":
+        data = _request(f"/search/users?q={encoded}&per_page={per}")
+        click.echo(_format_search_users(data, max_items))
+    elif search_type == "commits":
+        data = _request(f"/search/commits?q={encoded}&per_page={per}")
+        click.echo(_format_search_commits(data, max_items))
+    elif search_type == "topics":
+        data = _request(f"/search/topics?q={encoded}&per_page={per}")
+        click.echo(_format_search_topics(data, max_items))
+
+
+@cli.command(name="search-code")
+@click.argument("query")
+@click.option("--repo", "repo_filter", default=None, help="Restrict to repo (repo:owner/name)")
+@click.option("--max", "max_items", type=int, default=SEARCH_TOP, help="Max results (cap 20)")
+def search_code(query, repo_filter, max_items):
+    """Search code (requires auth; needs repo scope for private repos)."""
+    q = query
+    if repo_filter:
+        q = f"repo:{repo_filter} {q}"
+    encoded = urllib.parse.quote(q)
+    per = min(max(max_items, 1), 20)
+    data = _request(f"/search/code?q={encoded}&per_page={per}")
+    click.echo(_format_search_code(data, max_items))
+
+
+# ===========================================================================
+# Users & orgs
+# ===========================================================================
+@cli.command(name="user-view")
+@click.argument("login", required=False)
+def user_view(login):
+    """Show user profile (default: authenticated user)."""
+    path = f"/users/{login}" if login else "/user"
+    u = _request(path)
+    click.echo(f"login: {u.get('login', '?')}")
+    if u.get("name"):
+        click.echo(f"name: {u['name']}")
+    if u.get("bio"):
+        click.echo(f"bio: {u['bio']}")
+    if u.get("company"):
+        click.echo(f"company: {u['company']}")
+    if u.get("location"):
+        click.echo(f"location: {u['location']}")
+    if u.get("blog"):
+        click.echo(f"blog: {u['blog']}")
+    click.echo(f"followers: {u.get('followers', 0)} | following: {u.get('following', 0)} | repos: {u.get('public_repos', 0)} | gists: {u.get('public_gists', 0)}")
+    click.echo(f"created: {_d(u.get('created_at'))} | type: {u.get('type', '?')}")
+    if u.get("hireable"):
+        click.echo("hireable: yes")
+
+
+@cli.command(name="user-repos")
+@click.argument("login", required=False)
+@click.option("--sort", default="updated", help="created/updated/pushed/full_name")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def user_repos(login, sort, max_items):
+    """List a user's public repositories."""
+    path = f"/users/{login}/repos" if login else "/user/repos"
+    params = {"sort": sort}
+    items = _get_list(path, max_items=max_items, **params)
+    if not items:
+        click.echo("(none)")
+        return
+    for r in items:
+        click.echo(_fmt_repo_line(r))
+
+
+@cli.command(name="user-gists")
+@click.argument("login", required=False)
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def user_gists(login, max_items):
+    """List gists (default: authenticated user's gists)."""
+    path = f"/users/{login}/gists" if login else "/user/gists"
+    items = _get_list(path, max_items=max_items)
+    if not items:
+        click.echo("(none)")
+        return
+    for g in items:
+        files = list(g.get("files", {}).keys())
+        click.echo(f"{_sha7(g.get('id'))} | {(g.get('description') or '').strip()[:80]} | {len(files)} file(s) | {_d(g.get('created_at'))}")
+
+
+@cli.command(name="org-view")
+@click.argument("org")
+def org_view(org):
+    """Show organization info."""
+    o = _request(f"/orgs/{org}")
+    click.echo(f"org: {o.get('login', '?')}")
+    if o.get("name"):
+        click.echo(f"name: {o['name']}")
+    if o.get("description"):
+        click.echo(f"description: {o['description']}")
+    if o.get("location"):
+        click.echo(f"location: {o['location']}")
+    if o.get("blog"):
+        click.echo(f"blog: {o['blog']}")
+    click.echo(f"public repos: {o.get('public_repos', 0)} | members: {o.get('public_members_count', '?')} | type: {o.get('type', '?')}")
+    click.echo(f"created: {_d(o.get('created_at'))}")
+
+
+@cli.command(name="org-members")
+@click.argument("org")
+@click.option("--role", default=None, help="all/admin/member (orgs you admin)")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def org_members(org, role, max_items):
+    """List organization members (public members list; full list needs membership)."""
+    params = {}
+    if role:
+        params["role"] = role
+    items = _get_list(f"/orgs/{org}/members", max_items=max_items, **params)
+    if not items:
+        click.echo("(none or no access)")
+        return
+    for m in items:
+        click.echo(m.get("login", "?"))
+
+
+@cli.command(name="org-repos")
+@click.argument("org")
+@click.option("--type", "repo_type", default=None, help="all/public/private/forks/sources/member")
+@click.option("--sort", default="updated", help="created/updated/pushed/full_name")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def org_repos(org, repo_type, sort, max_items):
+    """List an organization's repositories."""
+    params = {"sort": sort}
+    if repo_type:
+        params["type"] = repo_type
+    items = _get_list(f"/orgs/{org}/repos", max_items=max_items, **params)
+    if not items:
+        click.echo("(none)")
+        return
+    for r in items:
+        click.echo(_fmt_repo_line(r))
+
+
+@cli.command(name="org-teams")
+@click.argument("org")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def org_teams(org, max_items):
+    """List teams in an organization."""
+    items = _get_list(f"/orgs/{org}/teams", max_items=max_items)
+    if not items:
+        click.echo("(none or no access)")
+        return
+    for t in items:
+        desc = (t.get("description") or "").strip()
+        extra = f" | {desc[:60]}" if desc else ""
+        click.echo(f"{t.get('name', '?')} | {t.get('slug', '?')} | {t.get('privacy', '?')}{extra}")
+
+
+# ===========================================================================
+# Gists
+# ===========================================================================
+@cli.command(name="gist-list")
+@click.option("--login", default=None, help="List this user's public gists (default: yours)")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def gist_list(login, max_items):
+    """List gists."""
+    path = f"/users/{login}/gists" if login else "/user/gists"
+    items = _get_list(path, max_items=max_items)
+    if not items:
+        click.echo("(none)")
+        return
+    for g in items:
+        files = list(g.get("files", {}).keys())
+        click.echo(f"{g.get('id', '?')} | {(g.get('description') or '').strip()[:80]} | {len(files)} file(s) | {_d(g.get('created_at'))}")
+
+
+@cli.command(name="gist-create")
+@click.option("--description", default="", help="Gist description")
+@click.option("--file", "files", multiple=True, help="Path of a file to include (repeatable)")
+@click.option("--name", "names", multiple=True, help="Filenames matching --content entries")
+@click.option("--content", "contents", multiple=True, help="File content (paired with --name)")
+@click.option("--public", "public_", is_flag=True, default=False, help="Create a public gist")
+@click.option("--stdin-name", default=None, help="Create one file from stdin with this name")
+def gist_create(description, files, names, contents, public_, stdin_name):
+    """Create a gist. Use --file for real files, or --name/--content pairs,
+    or --stdin-name to read one file from stdin."""
+    _check_token()
+    gist_files = {}
+    for fp in files:
+        try:
+            with open(fp, "r") as f:
+                gist_files[os.path.basename(fp)] = {"content": f.read()}
+        except OSError as e:
+            click.echo(f"Cannot read file {fp}: {e}", err=True)
+            sys.exit(1)
+    for name, content in zip(names, contents):
+        if not name:
+            click.echo("--name required for each --content", err=True)
+            sys.exit(1)
+        gist_files[name] = {"content": content}
+    if stdin_name:
+        if sys.stdin.isatty():
+            click.echo("--stdin-name requires piped stdin", err=True)
+            sys.exit(1)
+        gist_files[stdin_name] = {"content": sys.stdin.read()}
+    if not gist_files:
+        click.echo("No files provided. Use --file, --name/--content, or --stdin-name.", err=True)
+        sys.exit(1)
+    payload = {"description": description, "public": bool(public_), "files": gist_files}
+    data = _request("/gists", method="POST", json=payload)
+    click.echo(f"✓ Gist created: {data.get('html_url', data.get('id', ''))}")
+
+
+@cli.command(name="gist-view")
+@click.argument("gist_id")
+def gist_view(gist_id):
+    """View a gist with file contents (capped)."""
+    g = _request(f"/gists/{gist_id}")
+    desc = (g.get("description") or "").strip()
+    click.echo(f"gist: {gist_id} | {desc or '(no description)'} | {g.get('public', '?')} | {_d(g.get('created_at'))}")
+    files = g.get("files", {})
+    if not files:
+        click.echo("(no files)")
+        return
+    for fname, fdata in files.items():
+        click.echo(f"--- {fname} ({fdata.get('size', 0)} bytes) ---")
+        content = fdata.get("content") or "(truncated or binary)"
+        lines = content.splitlines()
+        total = len(lines)
+        for i, line in enumerate(lines[:MAX_FILE_LINES], 1):
+            click.echo(f"{i}: {line}")
+        if total > MAX_FILE_LINES:
+            click.echo(f"... (truncated: {total - MAX_FILE_LINES} more lines)")
+
+
+@cli.command(name="gist-delete")
+@click.argument("gist_id")
+@click.option("--yes", is_flag=True, default=False, help="Confirm deletion (required)")
+def gist_delete(gist_id, yes):
+    """Delete a gist (requires --yes)."""
+    if not yes:
+        click.echo("Add --yes to confirm gist deletion.", err=True)
+        sys.exit(1)
+    _request(f"/gists/{gist_id}", method="DELETE")
+    click.echo(f"✓ Gist {gist_id} deleted")
+
+
+# ===========================================================================
+# Releases
+# ===========================================================================
+@cli.command(name="release-list")
+@click.argument("repo")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def release_list(repo, max_items):
+    """List releases."""
+    items = _get_list(f"/repos/{repo}/releases", max_items=max_items)
+    if not items:
+        click.echo("(none)")
+        return
+    for r in items:
+        flags = []
+        if r.get("draft"):
+            flags.append("draft")
+        if r.get("prerelease"):
+            flags.append("pre")
+        flag_str = f" [{','.join(flags)}]" if flags else ""
+        assets = len(r.get("assets", []))
+        click.echo(f"{r.get('tag_name', '?')}{flag_str} | {(r.get('name') or r.get('tag_name') or '?')[:60]} | {_d(r.get('published_at'))} | {assets} assets")
+
+
+@cli.command(name="release-view")
+@click.argument("repo")
+@click.argument("tag", required=False)
+@click.option("--latest", is_flag=True, default=False, help="Show latest release")
+def release_view(repo, tag, latest):
+    """Show a release (by tag, or --latest)."""
+    if latest:
+        r = _request(f"/repos/{repo}/releases/latest")
+    elif tag:
+        r = _request(f"/repos/{repo}/releases/tags/{tag}")
+    else:
+        click.echo("Pass a TAG or --latest", err=True)
+        sys.exit(1)
+    click.echo(f"tag: {r.get('tag_name', '?')} | {(r.get('name') or '?')[:80]}")
+    click.echo(f"draft: {r.get('draft', False)} | prerelease: {r.get('prerelease', False)} | published: {_d(r.get('published_at'))}")
+    body = (r.get("body") or "").strip()
+    if body:
+        click.echo("--- body ---")
+        lines = body.splitlines()
+        total = len(lines)
+        for i, line in enumerate(lines[:200], 1):
+            click.echo(f"{i}: {line}")
+        if total > 200:
+            click.echo(f"... (truncated: {total - 200} more lines)")
+    assets = r.get("assets", [])
+    if assets:
+        click.echo("--- assets ---")
+        for a in assets:
+            click.echo(f"{a.get('name', '?')} | {a.get('size', 0)} bytes | {a.get('download_count', 0)} downloads")
+
+
+@cli.command(name="release-create")
+@click.argument("repo")
+@click.argument("tag")
+@click.option("--name", default=None, help="Release title (default: tag)")
+@click.option("--body", default=None, help="Release notes")
+@click.option("--body-file", default=None, help="Read release notes from file")
+@click.option("--target", default=None, help="Commit SHA or branch for the tag")
+@click.option("--draft", is_flag=True, default=False, help="Create as draft")
+@click.option("--prerelease", is_flag=True, default=False, help="Mark as prerelease")
+def release_create(repo, tag, name, body, body_file, target, draft, prerelease):
+    """Create a release."""
+    _check_token()
+    resolved = _resolve_body(body, body_file)
+    payload = {"tag_name": tag, "name": name or tag, "draft": draft, "prerelease": prerelease}
+    if resolved:
+        payload["body"] = resolved
+    if target:
+        payload["target_commitish"] = target
+    data = _request(f"/repos/{repo}/releases", method="POST", json=payload)
+    click.echo(f"✓ Release {tag} created: {data.get('html_url', '')}")
+
+
+@cli.command(name="release-delete")
+@click.argument("repo")
+@click.argument("tag")
+@click.option("--yes", is_flag=True, default=False, help="Confirm deletion (required)")
+def release_delete(repo, tag, yes):
+    """Delete a release (requires --yes). Tag remains unless deleted separately."""
+    if not yes:
+        click.echo("Add --yes to confirm release deletion.", err=True)
+        sys.exit(1)
+    r = _request(f"/repos/{repo}/releases/tags/{tag}")
+    _request(f"/repos/{repo}/releases/{r.get('id', '')}", method="DELETE")
+    click.echo(f"✓ Release {tag} deleted")
+
+
+@cli.command(name="release-upload")
+@click.argument("repo")
+@click.argument("tag")
+@click.argument("file_path")
+@click.option("--name", default=None, help="Asset name (default: file basename)")
+def release_upload(repo, tag, file_path, name):
+    """Upload an asset to a release (by tag)."""
+    _check_token()
+    r = _request(f"/repos/{repo}/releases/tags/{tag}")
+    rid = r.get("id")
+    if not rid:
+        click.echo(f"Release {tag} not found", err=True)
+        sys.exit(5)
+    data = _upload_file(f"/repos/{repo}/releases/{rid}/assets", file_path, name=name)
+    click.echo(f"✓ Uploaded {data.get('name', '?')} ({data.get('size', 0)} bytes)")
+
+
+# ===========================================================================
+# Notifications
+# ===========================================================================
+@cli.command(name="notif-list")
+@click.option("--all", "all_", is_flag=True, default=False, help="Include read notifications")
+@click.option("--participating", is_flag=True, default=False, help="Only participating")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def notif_list(all_, participating, max_items):
+    """List notifications for the authenticated user."""
+    params = {"all": "true" if all_ else "false", "participating": "true" if participating else "false"}
+    items = _get_list("/notifications", max_items=max_items, **params)
+    if not items:
+        click.echo("(none)")
+        return
+    for n in items:
+        subj = n.get("subject", {})
+        repo = (n.get("repository") or {}).get("full_name", "?")
+        unread = "UNREAD" if n.get("unread") else "read"
+        click.echo(f"{repo} | [{subj.get('type', '?')}] {(subj.get('title') or '?')[:80]} | {n.get('reason', '?')} | {unread}")
+
+
+@cli.command(name="notif-read")
+@click.option("--thread", default=None, help="Mark a single thread as read (else all)")
+def notif_read(thread):
+    """Mark notifications as read (all, or a single thread)."""
+    if thread:
+        _request(f"/notifications/threads/{thread}", method="PATCH", json={})
+        click.echo(f"✓ Thread {thread} marked read")
+    else:
+        _request("/notifications", method="PUT", json={"read": True})
+        click.echo("✓ All notifications marked read")
+
+
+# ===========================================================================
+# Patch application
+# ===========================================================================
+@cli.command(name="apply-patch")
 @click.argument("file_path")
 def apply_patch(file_path):
     """Apply a patch from stdin (unified diff or search/replace block)."""
@@ -846,8 +2566,10 @@ def apply_patch(file_path):
     click.echo(result)
 
 
-# ---- repo-init ----------------------------------------------------------
-@cli.command()
+# ===========================================================================
+# repo-init (macro)
+# ===========================================================================
+@cli.command(name="repo-init")
 @click.argument("name")
 @click.option("--description", default="", help="Repository description")
 @click.option("--private", "private_", is_flag=True, default=False, help="Create private repo")
@@ -937,8 +2659,10 @@ def repo_init(name, description, private_, org, dry_run):
     click.echo(f"✓ Repo created: {repo_data['html_url']}")
 
 
-# ---- create-pr ----------------------------------------------------------
-@cli.command()
+# ===========================================================================
+# create-pr (macro)
+# ===========================================================================
+@cli.command(name="create-pr")
 @click.argument("repo")
 @click.argument("base_branch")
 @click.argument("new_branch")
@@ -992,6 +2716,19 @@ def create_pr(repo, base_branch, new_branch, title, body, body_file, draft, dry_
     else:
         click.echo(f"Failed to create PR: HTTP {resp.status_code}\n{resp.text[:300]}", err=True)
         sys.exit(6)
+
+
+# ---------------------------------------------------------------------------
+# JSON helpers (kept tiny for the api passthrough)
+# ---------------------------------------------------------------------------
+def json_parse(text):
+    import json
+    return json.loads(text)
+
+
+def json_dumps(data):
+    import json
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
 # ---------------------------------------------------------------------------
