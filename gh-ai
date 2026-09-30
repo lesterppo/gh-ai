@@ -72,7 +72,7 @@ def _check_token():
 
 def _headers(accept="application/vnd.github.v3+json"):
     return {
-        "Authorization": f"token {GITHUB_TOKEN}",
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
         "Accept": accept,
         "User-Agent": "gh-ai",
     }
