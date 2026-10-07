@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """gh-ai — AI-native GitHub CLI. Token-optimized output for LLM consumption.
 
 Covers the full GitHub REST API surface with compact, agent-friendly output:
