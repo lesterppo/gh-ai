@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 """gh-ai — AI-native GitHub CLI. Token-optimized output for LLM consumption.
 
 Covers the full GitHub REST API surface with compact, agent-friendly output:
@@ -3432,6 +3432,51 @@ def advisory_view(repo, ghsa_id):
     click.echo(f"published: {_d(a.get('published_at'))} | updated: {_d(a.get('updated_at'))}")
     if a.get("description"):
         click.echo(f"description: {a['description'][:300]}")
+
+
+# advisory-search: global security-advisory search via GraphQL.
+# Uses the 2026-10-02 SecurityAdvisory additions (cveId, sourceCodeLocation,
+# githubReviewedAt, nvdPublishedAt, repositoryAdvisoryUrl fields; severities
+# and isWithdrawn server-side filters) - additive, read-only.
+# https://github.blog/changelog/2026-10-02-new-fields-for-securityadvisory-graphql-api/
+
+@cli.command(name="advisory-search")
+@click.option("--severities", default=None,
+              help="Comma-separated severities to filter on: CRITICAL,HIGH,MODERATE,LOW")
+@click.option("--withdrawn/--no-withdrawn", "withdrawn", default=None,
+              help="Only (or exclude) withdrawn advisories")
+@click.option("--max", "max_items", type=int, default=DEFAULT_LIST, help="Max results")
+def advisory_search(severities, withdrawn, max_items):
+    """Search global security advisories (GraphQL) with severity/withdrawn filters."""
+    variables = {"first": min(max_items, 100)}
+    if severities:
+        variables["severities"] = [s.strip().upper() for s in severities.split(",")]
+    if withdrawn is not None:
+        variables["isWithdrawn"] = withdrawn
+    query = ("query($first:Int,$severities:[SecurityAdvisorySeverity!],"
+             "$isWithdrawn:Boolean,$after:String){"
+             "securityAdvisories(first:$first,severities:$severities,"
+             "isWithdrawn:$isWithdrawn,after:$after){"
+             "nodes{ghsaId cveId severity summary githubReviewedAt nvdPublishedAt "
+             "sourceCodeLocation repositoryAdvisoryUrl}"
+             "pageInfo{hasNextPage endCursor}}}")
+    got = 0
+    after = None
+    while got < max_items:
+        variables["after"] = after
+        d = _gql(query, variables)["securityAdvisories"]
+        for a in d["nodes"]:
+            click.echo(f"{a.get('ghsaId', '?')} | {a.get('severity', '?')} | "
+                       f"{a.get('cveId') or 'no CVE'} | {(a.get('summary') or '?')[:80]}")
+            got += 1
+            if got >= max_items:
+                return
+        pi = d["pageInfo"]
+        if not pi["hasNextPage"]:
+            break
+        after = pi["endCursor"]
+    if got == 0:
+        click.echo("(none)")
 
 
 # ===========================================================================
