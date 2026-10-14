@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""gh-ai agent entry point (Muse Secure Vault).
+
+Fetches a fresh authd credential surrogate for the stored `custom.github`
+connector on every invocation and exposes it to the gh-ai CLI as
+GITHUB_TOKEN. The surrogate is an `hsurr:*` placeholder, not the real key:
+Sentinel/authd swaps it for the real credential on approved egress to
+api.github.com. The raw token never touches this process's memory, files,
+or logs.
+
+Usage: gh-ai-agent <command> [args...]  (identical to upstream gh-ai)
+
+Fix 2026-10-15: the `dynamic_credentials` helper moved across skill
+locations between deployments (`/opt/hatch/skills/skill-creator/bin` ->
+`/opt/hatch/workflow-skills/custom-connector-setup/bin`). Probe candidate
+locations instead of hardcoding one. Real-CLI and interpreter paths are
+likewise resolved with env overrides first, then repo-relative, then
+legacy install paths.
+
+Env overrides:
+  DYNAMIC_CREDENTIALS_DIR  dir containing dynamic_credentials.py
+  GH_AI_REAL_BIN           the real gh-ai CLI script
+  GH_AI_VENV_PYTHON        python with click/requests/PyYAML installed
+"""
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_HERE)  # wrappers/ -> repo root
+
+for _p in (
+    os.environ.get("DYNAMIC_CREDENTIALS_DIR", ""),
+    "/opt/hatch/skills/skill-creator/bin",  # legacy location
+    "/opt/hatch/workflow-skills/custom-connector-setup/bin",
+    "/opt/muse/skills/custom-connector-setup/bin",
+):
+    if _p and os.path.isdir(_p):
+        sys.path.insert(0, _p)
+        break
+else:
+    raise SystemExit(
+        "dynamic_credentials module not found; set DYNAMIC_CREDENTIALS_DIR")
+from dynamic_credentials import dynamic_credential_entry, ensure_allowed_url
+
+ALLOWED_HOSTS = ("api.github.com",)
+
+
+def _resolve_real_cli():
+    for cand in (
+        os.environ.get("GH_AI_REAL_BIN", ""),
+        os.path.join(_REPO_ROOT, "gh-ai"),
+        "/home/hatch/.local/bin/gh-ai-real",
+    ):
+        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    raise SystemExit("gh-ai real CLI not found; set GH_AI_REAL_BIN")
+
+
+def _resolve_python():
+    for cand in (
+        os.environ.get("GH_AI_VENV_PYTHON", ""),
+        os.path.join(_REPO_ROOT, ".venv", "bin", "python"),
+        "/home/hatch/.local/share/gh-ai-venv/bin/python",
+        sys.executable,
+    ):
+        if cand and os.path.isfile(cand):
+            return cand
+    raise SystemExit("no usable python interpreter found")
+
+
+def main() -> int:
+    ensure_allowed_url("https://api.github.com/", ALLOWED_HOSTS)
+    entry = dynamic_credential_entry("custom.github", "access_token")
+    surrogate = str(entry["surrogate"]).strip()
+    if not surrogate.startswith("hsurr:"):
+        raise SystemExit("authd did not return a surrogate credential")
+    env = dict(os.environ)
+    # Only the surrogate goes out; never a raw secret.
+    env["GITHUB_TOKEN"] = surrogate
+    env.pop("GITHUB_PERSONAL_ACCESS_TOKEN", None)
+    env.pop("GH_TOKEN", None)
+    python = _resolve_python()
+    real_cli = _resolve_real_cli()
+    os.execve(python, [python, real_cli, *sys.argv[1:]], env)
+    return 1  # unreachable
+
+
+if __name__ == "__main__":
+    main()
